@@ -16,6 +16,8 @@ import game
 GameSender = Callable[..., Any]
 RELATIONSHIP_DAYS = 3
 MAX_STAKE = 1000
+STAKE_SETUP_TTL_SECONDS = 40
+STAKE_PRESETS = (1, 5, 10, 20, 50, 100)
 MARRIAGE_WAIT_DAYS = 7
 MARRIAGE_TRUST_REQUIRED = 70
 MARRIAGE_COST = 20
@@ -154,6 +156,16 @@ def setup_db(db: sqlite3.Connection) -> None:
             ON race_games(chat_id,player_a,state);
         CREATE INDEX IF NOT EXISTS race_games_b_state
             ON race_games(chat_id,player_b,state);
+        CREATE TABLE IF NOT EXISTS pending_game_stakes (
+            setup_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            target_id INTEGER NOT NULL,
+            game_type TEXT NOT NULL,
+            prompt_message_id INTEGER,
+            expires_at INTEGER NOT NULL,
+            UNIQUE(chat_id,user_id)
+        );
         CREATE TABLE IF NOT EXISTS weekly_quests (
             cat_id INTEGER NOT NULL,
             week_start TEXT NOT NULL,
@@ -1435,6 +1447,238 @@ def _has_open_game(db: sqlite3.Connection, chat_id: int, user_id: int) -> bool:
     return bool(ttt or race)
 
 
+def _game_cats_for_challenge(
+    db: sqlite3.Connection,
+    chat_id: int,
+    user_id: int,
+    target_id: int,
+    send: GameSender,
+) -> tuple[sqlite3.Row, sqlite3.Row] | None:
+    if target_id == user_id:
+        send(chat_id, "Для игры нужен соперник.")
+        return None
+    if not _ensure_pair_cats(db, chat_id, user_id, target_id, send):
+        return None
+    if _has_open_game(db, chat_id, user_id) or _has_open_game(db, chat_id, target_id):
+        send(chat_id, "Один из игроков уже ждёт приглашение или играет в другую партию.")
+        return None
+    cat_a = _current_cat(db, chat_id, user_id)
+    cat_b = _current_cat(db, chat_id, target_id)
+    if not cat_a or not cat_b:
+        return None
+    if min(int(cat_a["stones"]), int(cat_b["stones"])) < 1:
+        send(chat_id, "У обоих игроков должен быть хотя бы 1 камушек для ставки.")
+        return None
+    return cat_a, cat_b
+
+
+def _start_game_invitation(
+    db: sqlite3.Connection,
+    chat_id: int,
+    user_id: int,
+    target_id: int,
+    game_type: str,
+    stake: int,
+    send: GameSender,
+) -> bool:
+    if not 1 <= stake <= MAX_STAKE:
+        send(chat_id, f"Ставка должна быть от 1 до {MAX_STAKE} камушков.")
+        return False
+    cats = _game_cats_for_challenge(db, chat_id, user_id, target_id, send)
+    if not cats:
+        return False
+    if any(int(cat["stones"]) < stake for cat in cats):
+        send(chat_id, "У обоих игроков должно хватать камушков на выбранную ставку.")
+        return False
+
+    if game_type == "ttt":
+        db.execute(
+            "INSERT INTO ttt_games(chat_id,player_x,player_o,stake,state,created_at) VALUES(?,?,?,?,?,?)",
+            (chat_id, user_id, target_id, stake, "pending", datetime.now(timezone.utc).isoformat()),
+        )
+        text = (
+            f"❎⭕ {_display_user(db, chat_id, user_id)} вызывает {_display_user(db, chat_id, target_id)} "
+            f"на крестики-нолики. Ставка: {stake} камушков с каждого. Ответь /accept или /decline."
+        )
+    elif game_type == "race":
+        db.execute(
+            "INSERT INTO race_games(chat_id,player_a,player_b,stake,state,created_at) VALUES(?,?,?,?,?,?)",
+            (chat_id, user_id, target_id, stake, "pending", datetime.now(timezone.utc).isoformat()),
+        )
+        text = (
+            f"🏁 {_display_user(db, chat_id, user_id)} вызывает {_display_user(db, chat_id, target_id)} "
+            f"на котогонку! Ставка — {stake} камушков с каждого. Ответь /accept или /decline."
+        )
+    else:
+        return False
+    db.commit()
+    send(chat_id, text)
+    return True
+
+
+def _begin_stake_setup(
+    db: sqlite3.Connection,
+    chat_id: int,
+    user_id: int,
+    target_id: int,
+    game_type: str,
+    send: GameSender,
+) -> None:
+    cats = _game_cats_for_challenge(db, chat_id, user_id, target_id, send)
+    if not cats:
+        return
+    max_available = min(MAX_STAKE, int(cats[0]["stones"]), int(cats[1]["stones"]))
+    now = int(time.time())
+    db.execute("DELETE FROM pending_game_stakes WHERE expires_at<=?", (now,))
+    db.execute("DELETE FROM pending_game_stakes WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+    cursor = db.execute(
+        "INSERT INTO pending_game_stakes(chat_id,user_id,target_id,game_type,expires_at) VALUES(?,?,?,?,?)",
+        (chat_id, user_id, target_id, game_type, now + STAKE_SETUP_TTL_SECONDS),
+    )
+    setup_id = int(cursor.lastrowid)
+    db.commit()
+
+    keyboard_rows = []
+    available_presets = [value for value in STAKE_PRESETS if value <= max_available]
+    for start in range(0, len(available_presets), 3):
+        keyboard_rows.append(
+            [
+                {"text": f"🪨 {value}", "callback_data": f"gs:{setup_id}:s:{value}"}
+                for value in available_presets[start:start + 3]
+            ]
+        )
+    keyboard_rows.append([{"text": "Отмена", "callback_data": f"gs:{setup_id}:x"}])
+    game_name = "крестики-нолики" if game_type == "ttt" else "котогонку"
+    text = (
+        f"🎲 Выбери ставку на {game_name} с {_display_user(db, chat_id, target_id)} кнопкой "
+        f"или отправь её числом от 1 до {max_available}. С каждого игрока спишется одинаковая сумма."
+    )
+    try:
+        sent = send(chat_id, text, reply_markup={"inline_keyboard": keyboard_rows})
+    except Exception:
+        db.execute("DELETE FROM pending_game_stakes WHERE setup_id=?", (setup_id,))
+        db.commit()
+        raise
+    prompt_message_id = sent.get("message_id") if isinstance(sent, dict) else None
+    if prompt_message_id:
+        db.execute(
+            "UPDATE pending_game_stakes SET prompt_message_id=? WHERE setup_id=?",
+            (int(prompt_message_id), setup_id),
+        )
+        db.commit()
+
+
+def handle_game_stake_callback(
+    db: sqlite3.Connection,
+    callback: dict[str, Any],
+    send: GameSender,
+    answer_callback: Callable[[str, str], Any],
+) -> bool:
+    data = str(callback.get("data", ""))
+    if not data.startswith("gs:"):
+        return False
+    query_id = str(callback.get("id", ""))
+    user_id = int(callback.get("from", {}).get("id", 0))
+    chat_id = int(callback.get("message", {}).get("chat", {}).get("id", 0))
+    try:
+        parts = data.split(":")
+        setup_id = int(parts[1])
+        action = parts[2]
+        stake = int(parts[3]) if action == "s" and len(parts) == 4 else 0
+    except (IndexError, ValueError):
+        answer_callback(query_id, "Не получилось прочитать выбор ставки.")
+        return True
+
+    setup = db.execute(
+        "SELECT * FROM pending_game_stakes WHERE setup_id=? AND chat_id=?",
+        (setup_id, chat_id),
+    ).fetchone()
+    if not setup:
+        answer_callback(query_id, "Время выбора ставки истекло. Запусти команду ещё раз.")
+        return True
+    if int(setup["user_id"]) != user_id:
+        answer_callback(query_id, "Эта настройка игры предназначена другому участнику.")
+        return True
+    if int(setup["expires_at"]) <= int(time.time()):
+        db.execute("DELETE FROM pending_game_stakes WHERE setup_id=?", (setup_id,))
+        db.commit()
+        answer_callback(query_id, "Время выбора ставки истекло. Запусти команду ещё раз.")
+        return True
+    if action == "x":
+        db.execute("DELETE FROM pending_game_stakes WHERE setup_id=?", (setup_id,))
+        db.commit()
+        answer_callback(query_id, "Вызов отменён.")
+        return True
+    if action != "s" or stake < 1 or stake > MAX_STAKE:
+        answer_callback(query_id, "Такой ставки нет. Выбери кнопку ещё раз.")
+        return True
+
+    started = _start_game_invitation(
+        db,
+        chat_id,
+        user_id,
+        int(setup["target_id"]),
+        str(setup["game_type"]),
+        stake,
+        send,
+    )
+    if started:
+        db.execute("DELETE FROM pending_game_stakes WHERE setup_id=?", (setup_id,))
+        db.commit()
+        answer_callback(query_id, "Вызов отправлен!")
+    else:
+        answer_callback(query_id, "Проверь сообщение бота и попробуй другую ставку.")
+    return True
+
+
+def handle_pending_game_stake(db: sqlite3.Connection, message: dict[str, Any], send: GameSender) -> bool:
+    chat_id = int(message.get("chat", {}).get("id", 0))
+    user = message.get("from", {})
+    user_id = int(user.get("id", 0))
+    if not chat_id or not user_id or user.get("is_bot"):
+        return False
+    setup = db.execute(
+        "SELECT * FROM pending_game_stakes WHERE chat_id=? AND user_id=?",
+        (chat_id, user_id),
+    ).fetchone()
+    if not setup:
+        return False
+
+    text = str(message.get("text", "")).strip()
+    replied_to_prompt = (
+        int(message.get("reply_to_message", {}).get("message_id", 0))
+        == int(setup["prompt_message_id"] or 0)
+    )
+    if not text.isdigit() and not replied_to_prompt:
+        return False
+    if int(setup["expires_at"]) <= int(time.time()):
+        db.execute("DELETE FROM pending_game_stakes WHERE setup_id=?", (setup["setup_id"],))
+        db.commit()
+        send(chat_id, "Время выбора ставки истекло. Запусти /ttt или /race ещё раз.")
+        return True
+    if not text.isdigit():
+        send(chat_id, f"Отправь ставку целым числом от 1 до {MAX_STAKE}, например 10.")
+        return True
+    stake = int(text)
+    if not 1 <= stake <= MAX_STAKE:
+        send(chat_id, f"Ставка должна быть целым числом от 1 до {MAX_STAKE}. Попробуй ещё раз.")
+        return True
+
+    started = _start_game_invitation(
+        db,
+        chat_id,
+        user_id,
+        int(setup["target_id"]),
+        str(setup["game_type"]),
+        stake,
+        send,
+    )
+    if started:
+        db.execute("DELETE FROM pending_game_stakes WHERE setup_id=?", (setup["setup_id"],))
+        db.commit()
+    return True
+
+
 def _game_for_user(db: sqlite3.Connection, chat_id: int, user_id: int, state: str) -> sqlite3.Row | None:
     return db.execute(
         "SELECT * FROM ttt_games WHERE chat_id=? AND state=? AND (player_x=? OR player_o=?) "
@@ -1490,34 +1734,28 @@ def _ttt_command(
 ) -> None:
     chat_id = int(message["chat"]["id"])
     user_id = int(message.get("from", {}).get("id", 0))
+    if command == "cancelgame":
+        pending_setup = db.execute(
+            "DELETE FROM pending_game_stakes WHERE chat_id=? AND user_id=?",
+            (chat_id, user_id),
+        )
+        if pending_setup.rowcount:
+            db.commit()
+            send(chat_id, "Настройка ставки отменена.")
+            return
     if command == "ttt":
         target = _target(db, chat_id, message, args)
         if not target:
-            send(chat_id, "Ответь на сообщение или укажи цель и ставку: /ttt @username 10.")
+            send(chat_id, "Ответь командой /ttt на сообщение соперника, чтобы выбрать ставку кнопкой или числом.")
             return
         target_id = int(target["id"])
-        if target_id == user_id:
-            send(chat_id, "Найди соперника для крестиков-ноликов.")
-            return
         stake = next((int(arg) for arg in args if arg.isdigit()), None)
-        if stake is None or stake < 1 or stake > MAX_STAKE:
-            send(chat_id, f"Укажи ставку от 1 до {MAX_STAKE} камушков: /ttt @username 10.")
+        if stake is None:
+            _begin_stake_setup(db, chat_id, user_id, target_id, "ttt", send)
             return
-        if not _ensure_pair_cats(db, chat_id, user_id, target_id, send):
-            return
-        if _has_open_game(db, chat_id, user_id) or _has_open_game(db, chat_id, target_id):
-            send(chat_id, "Один из игроков уже ждёт приглашение или играет в другую партию.")
-            return
-        cats = (_current_cat(db, chat_id, user_id), _current_cat(db, chat_id, target_id))
-        if any(not cat or int(cat["stones"]) < stake for cat in cats):
-            send(chat_id, "У обоих игроков должно быть достаточно камушков для ставки.")
-            return
-        db.execute(
-            "INSERT INTO ttt_games(chat_id,player_x,player_o,stake,state,created_at) VALUES(?,?,?,?,?,?)",
-            (chat_id, user_id, target_id, stake, "pending", datetime.now(timezone.utc).isoformat()),
-        )
+        db.execute("DELETE FROM pending_game_stakes WHERE chat_id=? AND user_id=?", (chat_id, user_id))
         db.commit()
-        send(chat_id, f"❎⭕ {_display_user(db, chat_id, user_id)} вызывает {_display_user(db, chat_id, target_id)} на крестики-нолики. Ставка: {stake} камушков с каждого. Ответь /accept или /decline.")
+        _start_game_invitation(db, chat_id, user_id, target_id, "ttt", stake, send)
         return
 
     if command == "cancelgame":
@@ -1681,31 +1919,16 @@ def _race_command(
     user_id = int(message.get("from", {}).get("id", 0))
     target = _target(db, chat_id, message, args)
     if not target:
-        send(chat_id, "Ответь на сообщение или укажи участника и ставку: /race @username 10.")
+        send(chat_id, "Ответь командой /race на сообщение соперника, чтобы выбрать ставку кнопкой или числом.")
         return
     target_id = int(target["id"])
-    if target_id == user_id:
-        send(chat_id, "Для котогонки нужен соперник.")
-        return
     stake = next((int(arg) for arg in args if arg.isdigit()), None)
-    if stake is None or not 1 <= stake <= MAX_STAKE:
-        send(chat_id, f"Укажи ставку от 1 до {MAX_STAKE} камушков: /race @username 10.")
+    if stake is None:
+        _begin_stake_setup(db, chat_id, user_id, target_id, "race", send)
         return
-    if not _ensure_pair_cats(db, chat_id, user_id, target_id, send):
-        return
-    if _has_open_game(db, chat_id, user_id) or _has_open_game(db, chat_id, target_id):
-        send(chat_id, "Один из игроков уже ждёт приглашение или играет в другую партию.")
-        return
-    cats = (_current_cat(db, chat_id, user_id), _current_cat(db, chat_id, target_id))
-    if any(not cat or int(cat["stones"]) < stake for cat in cats):
-        send(chat_id, "У обоих игроков должно быть достаточно камушков для ставки.")
-        return
-    db.execute(
-        "INSERT INTO race_games(chat_id,player_a,player_b,stake,state,created_at) VALUES(?,?,?,?,?,?)",
-        (chat_id, user_id, target_id, stake, "pending", datetime.now(timezone.utc).isoformat()),
-    )
+    db.execute("DELETE FROM pending_game_stakes WHERE chat_id=? AND user_id=?", (chat_id, user_id))
     db.commit()
-    send(chat_id, f"🏁 {_display_user(db, chat_id, user_id)} вызывает {_display_user(db, chat_id, target_id)} на котогонку! Ставка — {stake} камушков с каждого. Ответь /accept или /decline.")
+    _start_game_invitation(db, chat_id, user_id, target_id, "race", stake, send)
 
 
 def handle_command(

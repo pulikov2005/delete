@@ -34,8 +34,8 @@ WARN_TTL_SECONDS = 7 * 24 * 60 * 60
 WARN_BAN_SECONDS = 7 * 24 * 60 * 60
 INACTIVE_DEFAULT_DAYS = 7
 INACTIVE_MAX_DAYS = 365
-AUTO_DELETE_DELAY_SECONDS = 5 * 60
-INACTIVE_REVIEW_TTL_SECONDS = AUTO_DELETE_DELAY_SECONDS
+AUTO_DELETE_DELAY_SECONDS = 40
+INACTIVE_REVIEW_TTL_SECONDS = 5 * 60
 AUTO_DELETE_DB: sqlite3.Connection | None = None
 
 MUTE_PERMISSIONS = {
@@ -235,13 +235,21 @@ def send_message(chat_id: int, text: str, **extra: Any) -> Any:
     delete_after = int(extra.pop("auto_delete_after", AUTO_DELETE_DELAY_SECONDS))
     result = api("sendMessage", {"chat_id": chat_id, "text": text, **extra})
     message_id = result.get("message_id") if isinstance(result, dict) else None
-    if auto_delete and delete_after > 0 and int(chat_id) < 0 and message_id and AUTO_DELETE_DB is not None:
-        AUTO_DELETE_DB.execute(
-            "INSERT OR IGNORE INTO auto_delete_messages(chat_id,message_id,delete_at) VALUES(?,?,?)",
-            (int(chat_id), int(message_id), int(time.time()) + delete_after),
-        )
-        AUTO_DELETE_DB.commit()
+    if auto_delete and message_id and AUTO_DELETE_DB is not None:
+        schedule_auto_delete(AUTO_DELETE_DB, int(chat_id), int(message_id), delete_after)
     return result
+
+
+def schedule_auto_delete(
+    db: sqlite3.Connection, chat_id: int, message_id: int, delete_after: int
+) -> None:
+    if int(chat_id) >= 0 or int(message_id) <= 0 or int(delete_after) <= 0:
+        return
+    db.execute(
+        "INSERT OR IGNORE INTO auto_delete_messages(chat_id,message_id,delete_at) VALUES(?,?,?)",
+        (int(chat_id), int(message_id), int(time.time()) + int(delete_after)),
+    )
+    db.commit()
 
 
 def process_due_auto_deletes(db: sqlite3.Connection, now: int | None = None) -> None:
@@ -266,7 +274,7 @@ def process_due_auto_deletes(db: sqlite3.Connection, now: int | None = None) -> 
                 )
             else:
                 logging.warning(
-                    "Could not auto-delete bot message %s in chat %s: %s",
+                    "Could not auto-delete message %s in chat %s: %s",
                     row["message_id"], row["chat_id"], exc,
                 )
                 db.execute(
@@ -551,6 +559,7 @@ def prepare_inactive_review(
         "Сохранённая игровая статистика учтена; для остальных отсчёт начинается после установки этой версии.",
         parse_mode="HTML",
         reply_markup=keyboard,
+        auto_delete_after=INACTIVE_REVIEW_TTL_SECONDS,
     )
 
 
@@ -990,7 +999,7 @@ def handle_group_command(
             "<code>/mute @username 1M</code> — мут на месяц; можно также ответить командой на сообщение участника.\n"
             "<code>/ban @username 2H</code> — временный бан; срок задаётся так же через H, D или M.\n"
             "<code>/inactive</code> или <code>/inactive 7</code> — показать активных за период и кандидатов, не писавших 7 дней; удаление — после подтверждения (только админ).\n"
-            "Сообщения бота в беседе удаляются через 5 минут; ответы о кормлении — через 10 секунд, вопросы викторины остаются.\n"
+            "Команды и сообщения бота удаляются примерно через 40 секунд; вопросы викторины и подтверждение /inactive остаются на время действия.\n"
             "<code>/unmute</code> — снять мут с участника.\n"
             "<code>/practice 5</code> — отправить участника решать 5 лёгких примеров; "
             "при ответе на сообщение команда выбирает участника из этого сообщения.\n\n"
@@ -1015,8 +1024,7 @@ def handle_group_command(
             "<code>/shop</code>, <code>/buy предмет</code>, <code>/items</code>, <code>/use предмет</code>.\n"
             "Есть автокормушка, игрушечная мышка и палочка нежности.\n\n"
             "<b>Мини-игра</b>\n"
-            "<code>/ttt @username 10</code> — крестики-нолики на ставку по 10 камушков с каждого.\n"
-            "<code>/race @username 10</code> — котогонка на ловкость и удачу.\n"
+            "Ответь командой <code>/ttt</code> или <code>/race</code> на сообщение соперника, чтобы выбрать ставку кнопкой или отправить её числом. Можно также сразу указать <code>@username</code> и сумму.\n"
             "<code>/accept</code> или <code>/decline</code>, отменить своё приглашение — <code>/cancelgame</code>.\n"
             "Ходы — <code>/move 1</code>…<code>/move 9</code>; выйти — <code>/resign</code>.\n\n"
             "<b>Недельные задания и викторина</b>\n"
@@ -1341,15 +1349,18 @@ def handle_group_command(
 def handle_update(db: sqlite3.Connection, update: dict[str, Any], bot_username: str) -> None:
     callback = update.get("callback_query")
     if callback:
+        answer_callback = lambda query_id, text: api(
+            "answerCallbackQuery",
+            {"callback_query_id": query_id, "text": text, "show_alert": False},
+        )
         handled = social_game.handle_quiz_callback(
             db,
             callback,
             send_message,
-            lambda query_id, text: api(
-                "answerCallbackQuery",
-                {"callback_query_id": query_id, "text": text, "show_alert": False},
-            ),
+            answer_callback,
         )
+        if not handled:
+            handled = social_game.handle_game_stake_callback(db, callback, send_message, answer_callback)
         if not handled:
             handle_inactive_callback(db, callback)
         return
@@ -1373,6 +1384,17 @@ def handle_update(db: sqlite3.Connection, update: dict[str, Any], bot_username: 
 
     if chat.get("type") not in ("group", "supergroup"):
         return
+    parsed = parse_command(text)
+    if not parsed and social_game.handle_pending_game_stake(db, message, send_message):
+        if user:
+            remember_user(db, int(chat["id"]), user, None)
+        schedule_auto_delete(
+            db,
+            int(chat["id"]),
+            int(message.get("message_id", 0)),
+            AUTO_DELETE_DELAY_SECONDS,
+        )
+        return
     if user:
         activity_at = None
         if game.is_activity_message(message):
@@ -1381,9 +1403,19 @@ def handle_update(db: sqlite3.Connection, update: dict[str, Any], bot_username: 
             except (TypeError, ValueError):
                 activity_at = int(time.time())
         remember_user(db, int(chat["id"]), user, activity_at)
-    parsed = parse_command(text)
     if parsed:
-        handle_group_command(db, message, parsed[0], parsed[1], bot_username)
+        command_head = (text or "").strip().split(maxsplit=1)[0][1:]
+        target_bot = command_head.split("@", 1)[1].casefold() if "@" in command_head else ""
+        try:
+            handle_group_command(db, message, parsed[0], parsed[1], bot_username)
+        finally:
+            if not target_bot or target_bot == bot_username.casefold():
+                schedule_auto_delete(
+                    db,
+                    int(chat["id"]),
+                    int(message.get("message_id", 0)),
+                    AUTO_DELETE_DELAY_SECONDS,
+                )
     else:
         game.record_group_message(db, message, send_message)
 
@@ -1433,8 +1465,8 @@ def main() -> None:
                 {"command": "buy", "description": "Купить предмет за камушки"},
                 {"command": "items", "description": "Посмотреть вещи котика"},
                 {"command": "use", "description": "Использовать предмет"},
-                {"command": "ttt", "description": "Вызвать на крестики-нолики на камушки"},
-                {"command": "race", "description": "Вызвать на котогонку"},
+                {"command": "ttt", "description": "Ответом на сообщение выбрать ставку в крестиках-ноликах"},
+                {"command": "race", "description": "Ответом на сообщение выбрать ставку в котогонке"},
                 {"command": "accept", "description": "Принять вызов в игру"},
                 {"command": "decline", "description": "Отклонить вызов в игру"},
                 {"command": "cancelgame", "description": "Отменить своё приглашение"},
