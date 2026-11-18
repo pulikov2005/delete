@@ -6,6 +6,7 @@ import json
 import logging
 import random
 import sqlite3
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
@@ -443,7 +444,7 @@ def publish_due_quiz_questions(db: sqlite3.Connection, send: GameSender) -> None
             ]
         }
         try:
-            sent = send(chat_id, text, parse_mode="HTML", reply_markup=keyboard)
+            sent = send(chat_id, text, parse_mode="HTML", reply_markup=keyboard, auto_delete=False)
         except Exception:
             db.execute("UPDATE daily_quiz_posts SET status='failed' WHERE post_id=?", (post_id,))
             db.commit()

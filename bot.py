@@ -34,7 +34,9 @@ WARN_TTL_SECONDS = 7 * 24 * 60 * 60
 WARN_BAN_SECONDS = 7 * 24 * 60 * 60
 INACTIVE_DEFAULT_DAYS = 7
 INACTIVE_MAX_DAYS = 365
-INACTIVE_REVIEW_TTL_SECONDS = 10 * 60
+AUTO_DELETE_DELAY_SECONDS = 5 * 60
+INACTIVE_REVIEW_TTL_SECONDS = AUTO_DELETE_DELAY_SECONDS
+AUTO_DELETE_DB: sqlite3.Connection | None = None
 
 MUTE_PERMISSIONS = {
     "can_send_messages": False,
@@ -95,6 +97,36 @@ def api(method: str, payload: dict[str, Any] | None = None) -> Any:
     return result.get("result")
 
 
+def backfill_activity_from_game_stats(db: sqlite3.Connection, chat_id: int | None = None) -> None:
+    query = (
+        "SELECT u.chat_id,u.user_id,MAX(d.day) AS last_day "
+        "FROM known_users u JOIN cats c ON c.chat_id=u.chat_id AND c.user_id=u.user_id "
+        "JOIN cat_days d ON d.cat_id=c.cat_id "
+        "WHERE u.last_message_at=0 AND d.message_count>0"
+    )
+    params: tuple[int, ...] = ()
+    if chat_id is not None:
+        query += " AND u.chat_id=?"
+        params = (chat_id,)
+    query += " GROUP BY u.chat_id,u.user_id"
+    historical_activity = db.execute(query, params).fetchall()
+    local_timezone = ZoneInfo("Asia/Yekaterinburg")
+    for row in historical_activity:
+        try:
+            last_day = datetime.strptime(row["last_day"], "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            continue
+        # Use the end of the recorded day so day-level history never marks someone inactive early.
+        estimated_activity = datetime.combine(
+            last_day + timedelta(days=1), datetime.min.time(), tzinfo=local_timezone
+        )
+        db.execute(
+            "UPDATE known_users SET last_message_at=? WHERE chat_id=? AND user_id=? AND last_message_at=0",
+            (int(estimated_activity.timestamp()), row["chat_id"], row["user_id"]),
+        )
+    db.commit()
+
+
 def connect_db() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(DB_PATH)
@@ -108,6 +140,7 @@ def connect_db() -> sqlite3.Connection:
             username TEXT,
             first_name TEXT NOT NULL,
             last_activity INTEGER NOT NULL DEFAULT 0,
+            last_message_at INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (chat_id, user_id)
         );
         CREATE INDEX IF NOT EXISTS known_users_username
@@ -162,13 +195,25 @@ def connect_db() -> sqlite3.Connection:
             expires_at INTEGER NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending'
         );
+        CREATE TABLE IF NOT EXISTS auto_delete_messages (
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            delete_at INTEGER NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(chat_id,message_id)
+        );
         """
     )
     known_user_columns = {row["name"] for row in db.execute("PRAGMA table_info(known_users)").fetchall()}
     if "last_activity" not in known_user_columns:
         db.execute("ALTER TABLE known_users ADD COLUMN last_activity INTEGER NOT NULL DEFAULT 0")
+    if "last_message_at" not in known_user_columns:
+        db.execute("ALTER TABLE known_users ADD COLUMN last_message_at INTEGER NOT NULL DEFAULT 0")
     db.execute(
         "CREATE INDEX IF NOT EXISTS known_users_activity ON known_users(chat_id,last_activity)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS known_users_message_activity ON known_users(chat_id,last_message_at)"
     )
     warning_columns = {row["name"] for row in db.execute("PRAGMA table_info(warnings)").fetchall()}
     if "expires_at" not in warning_columns:
@@ -180,33 +225,60 @@ def connect_db() -> sqlite3.Connection:
     expire_warnings(db, now=int(time.time()))
     game.setup_db(db)
     social_game.setup_db(db)
-    historical_activity = db.execute(
-        "SELECT u.chat_id,u.user_id,MAX(d.day) AS last_day "
-        "FROM known_users u JOIN cats c ON c.chat_id=u.chat_id AND c.user_id=u.user_id "
-        "JOIN cat_days d ON d.cat_id=c.cat_id "
-        "WHERE u.last_activity=0 AND d.message_count>0 "
-        "GROUP BY u.chat_id,u.user_id"
-    ).fetchall()
-    local_timezone = ZoneInfo("Asia/Yekaterinburg")
-    for row in historical_activity:
-        try:
-            last_day = datetime.strptime(row["last_day"], "%Y-%m-%d").date()
-        except (TypeError, ValueError):
-            continue
-        # Use the end of the recorded day so day-level history never marks someone inactive early.
-        estimated_activity = datetime.combine(
-            last_day + timedelta(days=1), datetime.min.time(), tzinfo=local_timezone
-        )
-        db.execute(
-            "UPDATE known_users SET last_activity=? WHERE chat_id=? AND user_id=? AND last_activity=0",
-            (int(estimated_activity.timestamp()), row["chat_id"], row["user_id"]),
-        )
+    backfill_activity_from_game_stats(db)
     db.commit()
     return db
 
 
 def send_message(chat_id: int, text: str, **extra: Any) -> Any:
-    return api("sendMessage", {"chat_id": chat_id, "text": text, **extra})
+    auto_delete = bool(extra.pop("auto_delete", True))
+    delete_after = int(extra.pop("auto_delete_after", AUTO_DELETE_DELAY_SECONDS))
+    result = api("sendMessage", {"chat_id": chat_id, "text": text, **extra})
+    message_id = result.get("message_id") if isinstance(result, dict) else None
+    if auto_delete and delete_after > 0 and int(chat_id) < 0 and message_id and AUTO_DELETE_DB is not None:
+        AUTO_DELETE_DB.execute(
+            "INSERT OR IGNORE INTO auto_delete_messages(chat_id,message_id,delete_at) VALUES(?,?,?)",
+            (int(chat_id), int(message_id), int(time.time()) + delete_after),
+        )
+        AUTO_DELETE_DB.commit()
+    return result
+
+
+def process_due_auto_deletes(db: sqlite3.Connection, now: int | None = None) -> None:
+    now = int(time.time()) if now is None else int(now)
+    rows = db.execute(
+        "SELECT chat_id,message_id,attempts FROM auto_delete_messages WHERE delete_at<=? "
+        "ORDER BY delete_at LIMIT 100",
+        (now,),
+    ).fetchall()
+    for row in rows:
+        try:
+            api("deleteMessage", {"chat_id": row["chat_id"], "message_id": row["message_id"]})
+        except TelegramError as exc:
+            description = str(exc).lower()
+            retryable = "network error" in description or "too many requests" in description or "429" in description
+            attempts = int(row["attempts"])
+            if retryable and attempts < 4:
+                db.execute(
+                    "UPDATE auto_delete_messages SET attempts=attempts+1,delete_at=? "
+                    "WHERE chat_id=? AND message_id=?",
+                    (now + 60, row["chat_id"], row["message_id"]),
+                )
+            else:
+                logging.warning(
+                    "Could not auto-delete bot message %s in chat %s: %s",
+                    row["message_id"], row["chat_id"], exc,
+                )
+                db.execute(
+                    "DELETE FROM auto_delete_messages WHERE chat_id=? AND message_id=?",
+                    (row["chat_id"], row["message_id"]),
+                )
+        else:
+            db.execute(
+                "DELETE FROM auto_delete_messages WHERE chat_id=? AND message_id=?",
+                (row["chat_id"], row["message_id"]),
+            )
+    db.commit()
 
 
 def remember_user(
@@ -219,12 +291,13 @@ def remember_user(
     if not user_id:
         return
     username = user.get("username", "").lower() or None
-    activity_at = int(time.time()) if activity_at is None else int(activity_at)
+    message_at = 0 if activity_at is None else max(0, int(activity_at))
     db.execute(
-        "INSERT INTO known_users(chat_id,user_id,username,first_name,last_activity) VALUES(?,?,?,?,?) "
-        "ON CONFLICT(chat_id,user_id) DO UPDATE SET username=excluded.username, "
-        "first_name=excluded.first_name,last_activity=MAX(known_users.last_activity,excluded.last_activity)",
-        (chat_id, user_id, username, user.get("first_name", "котик"), activity_at),
+        "INSERT INTO known_users(chat_id,user_id,username,first_name,last_activity,last_message_at) "
+        "VALUES(?,?,?,?,0,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET username=excluded.username, "
+        "first_name=excluded.first_name,last_message_at=CASE WHEN excluded.last_message_at>0 "
+        "THEN MAX(known_users.last_message_at,excluded.last_message_at) ELSE known_users.last_message_at END",
+        (chat_id, user_id, username, user.get("first_name", "котик"), message_at),
     )
     db.commit()
 
@@ -369,12 +442,19 @@ def prepare_inactive_review(
         return
 
     now = int(time.time())
+    backfill_activity_from_game_stats(db, chat_id)
     cutoff = now - days * 24 * 60 * 60
+    recent_count = int(
+        db.execute(
+            "SELECT COUNT(*) FROM known_users WHERE chat_id=? AND last_message_at>?",
+            (chat_id, cutoff),
+        ).fetchone()[0]
+    )
     rows = db.execute(
-        "SELECT u.user_id,u.username,u.first_name,u.last_activity "
+        "SELECT u.user_id,u.username,u.first_name,u.last_message_at "
         "FROM known_users u LEFT JOIN moderators m ON m.chat_id=u.chat_id AND m.user_id=u.user_id "
-        "WHERE u.chat_id=? AND u.last_activity>0 AND u.last_activity<=? AND m.user_id IS NULL "
-        "ORDER BY u.last_activity ASC",
+        "WHERE u.chat_id=? AND u.last_message_at>0 AND u.last_message_at<=? AND m.user_id IS NULL "
+        "ORDER BY u.last_message_at ASC",
         (chat_id, cutoff),
     ).fetchall()
 
@@ -398,7 +478,7 @@ def prepare_inactive_review(
                 "user_id": int(row["user_id"]),
                 "username": row["username"],
                 "first_name": row["first_name"],
-                "last_activity": int(row["last_activity"]),
+                "last_message_at": int(row["last_message_at"]),
             }
         )
 
@@ -410,10 +490,17 @@ def prepare_inactive_review(
                 "с правом ограничивать участников, и повтори команду.",
             )
         else:
+            tracked_count = int(
+                db.execute(
+                    "SELECT COUNT(*) FROM known_users WHERE chat_id=? AND last_message_at>0",
+                    (chat_id,),
+                ).fetchone()[0]
+            )
             send_message(
                 chat_id,
-                f"🐾 Пока нет участников, не писавших {days} дней и дольше. "
-                "Для пользователей без сохранённой истории отсчёт начнётся после их первого сообщения с этой версии.",
+                f"🐾 За последние {days} дней написали хотя бы одно сообщение {recent_count} пользователей. "
+                f"Неактивных участников для удаления не нашёл. Учтена история {tracked_count} пользователей; "
+                "/stats показывает накопленное число сообщений за всё время.",
             )
         return
 
@@ -438,7 +525,7 @@ def prepare_inactive_review(
         user_id = candidate["user_id"]
         first_name = html.escape(candidate["first_name"] or "участник")
         username = f" (@{html.escape(candidate['username'])})" if candidate["username"] else ""
-        inactive_days = max(0, (now - candidate["last_activity"]) // (24 * 60 * 60))
+        inactive_days = max(0, (now - candidate["last_message_at"]) // (24 * 60 * 60))
         lines.append(
             f"• <a href=\"tg://user?id={user_id}\">{first_name}</a>{username} — {inactive_days} дн."
         )
@@ -456,10 +543,11 @@ def prepare_inactive_review(
     send_message(
         chat_id,
         f"😴 <b>Проверка неактивности: {days} дн.</b>\n"
-        f"Список кандидатов ({len(candidates)}): участники не писали в беседу {days} дней или дольше.\n"
+        f"За последние {days} дней написали хотя бы одно сообщение {recent_count} пользователей.\n"
+        f"Неактивные кандидаты на удаление ({len(candidates)}): не писали {days} дней или дольше.\n"
         + "\n".join(lines)
         + "\n\nПосле подтверждения бот удалит их из беседы и снимет блокировку. "
-        "Они смогут вернуться по ссылке-приглашению. Подтверждение действует 10 минут. "
+        "Они смогут вернуться по ссылке-приглашению. Подтверждение действует 5 минут. "
         "Сохранённая игровая статистика учтена; для остальных отсчёт начинается после установки этой версии.",
         parse_mode="HTML",
         reply_markup=keyboard,
@@ -541,10 +629,10 @@ def handle_inactive_callback(
     unban_errors = 0
     for user_id in user_ids:
         last = db.execute(
-            "SELECT last_activity FROM known_users WHERE chat_id=? AND user_id=?",
+            "SELECT last_message_at FROM known_users WHERE chat_id=? AND user_id=?",
             (chat_id, user_id),
         ).fetchone()
-        if not last or int(last["last_activity"]) <= 0 or int(last["last_activity"]) > cutoff:
+        if not last or int(last["last_message_at"]) <= 0 or int(last["last_message_at"]) > cutoff:
             skipped += 1
             continue
         if db.execute(
@@ -901,7 +989,8 @@ def handle_group_command(
             "<code>/mute forever</code> — постоянный мут: читать можно, писать нельзя.\n"
             "<code>/mute @username 1M</code> — мут на месяц; можно также ответить командой на сообщение участника.\n"
             "<code>/ban @username 2H</code> — временный бан; срок задаётся так же через H, D или M.\n"
-            "<code>/inactive</code> или <code>/inactive 7</code> — показать неактивных 7 дней и предложить подтвердить удаление с разблокировкой (только админ).\n"
+            "<code>/inactive</code> или <code>/inactive 7</code> — показать активных за период и кандидатов, не писавших 7 дней; удаление — после подтверждения (только админ).\n"
+            "Сообщения бота в беседе удаляются через 5 минут; ответы о кормлении — через 10 секунд, вопросы викторины остаются.\n"
             "<code>/unmute</code> — снять мут с участника.\n"
             "<code>/practice 5</code> — отправить участника решать 5 лёгких примеров; "
             "при ответе на сообщение команда выбирает участника из этого сообщения.\n\n"
@@ -909,9 +998,10 @@ def handle_group_command(
             "<code>/warns</code> — посмотреть свои предупреждения; модератор или админ может указать другого участника. <code>/unwarn</code> — снять последнее, <code>/warnclear</code> — снять все (только админ).\n"
             "<code>/stats</code> — статистика беседы; ответь командой на сообщение или укажи @username для личной статистики.\n\n"
             "🐱 <code>/cat Имя</code> — завести котика с именем или посмотреть своего.\n"
-            "<code>/rename Имя</code> — сменить имя за 10 камушков. <code>/task</code>, <code>/feed</code>, "
-            "<code>/brush</code>, <code>/clean</code> — уход. <code>/train сила</code> — тренировка.\n"
-            "Котик остаётся с хозяином: возраста, смерти, травм и мемориала нет.\n\n"
+            "<code>/rename Имя</code> — переименовать котика; цена — 10 камушков. <code>/task</code> — ежедневное задание.\n"
+            "<code>/feed</code> — потратить рыбку и повысить настроение на 1; активный мини-котёнок средней редкости даёт ещё +1.\n"
+            "<code>/brush</code>, <code>/clean</code> — уход; <code>/train сила</code> — тренировка за камушки.\n"
+            "\n"
             "<b>Отношения</b>\n"
             "<code>/kiss @username</code> — взаимная симпатия; пара создаётся после трёх взаимных дней.\n"
             "<code>/relationship</code>, <code>/jealous</code> — статус и доверие. <code>/hug @партнёр</code> — укрепить доверие.\n"
@@ -925,11 +1015,11 @@ def handle_group_command(
             "Есть автокормушка, игрушечная мышка и палочка нежности.\n\n"
             "<b>Мини-игра</b>\n"
             "<code>/ttt @username 10</code> — крестики-нолики на ставку по 10 камушков с каждого.\n"
-            "<code>/race @username 10</code> — безопасная котогонка на ловкость и удачу.\n"
+            "<code>/race @username 10</code> — котогонка на ловкость и удачу.\n"
             "<code>/accept</code> или <code>/decline</code>, отменить своё приглашение — <code>/cancelgame</code>.\n"
             "Ходы — <code>/move 1</code>…<code>/move 9</code>; выйти — <code>/resign</code>.\n\n"
             "<b>Недельные задания и викторина</b>\n"
-            "<code>/weekly</code> — личное задание недели; три общих вопроса викторины выходят в 10:00, 15:00 и 20:00 по Екатеринбургу. Одна попытка на вопрос; награду получает первый верный ответ. Отвечай кнопкой или командами <code>/answer 1</code>, <code>/answer 2</code>, <code>/answer 3</code>. <code>/quiz</code> покажет расписание и твой прогресс.\n"
+            "<code>/weekly</code> — личное задание недели; три общих вопроса викторины выходят в 10:00, 15:00 и 20:00. Отвечай кнопкой или командами <code>/answer 1</code>, <code>/answer 2</code>, <code>/answer 3</code>. <code>/quiz</code> покажет расписание и твой прогресс.\n"
             "<code>/leaderboard</code> — рейтинг котиков за неделю. Характер виден в профиле и влияет на небольшой бонус.\n\n"
             "<code>/modadd</code> и <code>/modremove</code> — выдать или снять роль модератора; "
             "модератор может мутить, снимать мут и выдавать WARN.\n"
@@ -1283,10 +1373,12 @@ def handle_update(db: sqlite3.Connection, update: dict[str, Any], bot_username: 
     if chat.get("type") not in ("group", "supergroup"):
         return
     if user:
-        try:
-            activity_at = int(message.get("date", time.time()))
-        except (TypeError, ValueError):
-            activity_at = None
+        activity_at = None
+        if game.is_activity_message(message):
+            try:
+                activity_at = int(message.get("date", time.time()))
+            except (TypeError, ValueError):
+                activity_at = int(time.time())
         remember_user(db, int(chat["id"]), user, activity_at)
     parsed = parse_command(text)
     if parsed:
@@ -1296,10 +1388,12 @@ def handle_update(db: sqlite3.Connection, update: dict[str, Any], bot_username: 
 
 
 def main() -> None:
+    global AUTO_DELETE_DB
     if not TOKEN:
         raise SystemExit("Set BOT_TOKEN before starting the bot.")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     db = connect_db()
+    AUTO_DELETE_DB = db
     me = api("getMe")
     bot_username = me.get("username", "")
     if not bot_username:
@@ -1320,7 +1414,7 @@ def main() -> None:
                 {"command": "warnclear", "description": "Снять все предупреждения (админ)"},
                 {"command": "stats", "description": "Статистика котиков и сообщений"},
                 {"command": "cat", "description": "Завести котика с именем или посмотреть статус"},
-                {"command": "rename", "description": "Сменить имя за 10 камушков"},
+                {"command": "rename", "description": "Переименовать котика (10 камушков)"},
                 {"command": "kiss", "description": "Выразить симпатию взаимно"},
                 {"command": "hug", "description": "Укрепить доверие в паре"},
                 {"command": "relationship", "description": "Посмотреть статус отношений"},
@@ -1339,7 +1433,7 @@ def main() -> None:
                 {"command": "items", "description": "Посмотреть вещи котика"},
                 {"command": "use", "description": "Использовать предмет"},
                 {"command": "ttt", "description": "Вызвать на крестики-нолики на камушки"},
-                {"command": "race", "description": "Вызвать на безопасную котогонку"},
+                {"command": "race", "description": "Вызвать на котогонку"},
                 {"command": "accept", "description": "Принять вызов в игру"},
                 {"command": "decline", "description": "Отклонить вызов в игру"},
                 {"command": "cancelgame", "description": "Отменить своё приглашение"},
@@ -1364,7 +1458,11 @@ def main() -> None:
     offset = 0
     while True:
         try:
-            social_game.publish_due_quiz_questions(db, send_message)
+            process_due_auto_deletes(db)
+            try:
+                social_game.publish_due_quiz_questions(db, send_message)
+            except Exception:
+                logging.exception("Could not publish scheduled quiz questions")
             updates = api(
                 "getUpdates",
                 {"offset": offset, "timeout": 30, "allowed_updates": ["message", "callback_query"]},

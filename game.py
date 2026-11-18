@@ -13,6 +13,7 @@ GameSender = Callable[..., Any]
 MAX_LEVEL = 20
 MAX_FISH = 12
 MAX_MOOD = 10
+FEED_NOTICE_DELETE_SECONDS = 10
 TASK_CHANCE = 0.35
 RENAME_COST = 10
 PERSONALITIES = ("Любознательный", "Игривый", "Ласковый", "Шустрый", "Упорный")
@@ -359,13 +360,17 @@ def _handle_feed(db: sqlite3.Connection, chat_id: int, user_id: int, send: GameS
     cat, daily, notices = _prepare_cat(db, chat_id, user_id)
     _send_notices(send, chat_id, notices)
     if not cat:
-        send(chat_id, "Сначала заведи котика командой /cat.")
+        send(chat_id, "Сначала заведи котика командой /cat.", auto_delete_after=FEED_NOTICE_DELETE_SECONDS)
         return
     if daily["fed"]:
-        send(chat_id, "🐟 Сегодня котик уже покормлен.")
+        send(chat_id, "🐟 Сегодня котик уже покормлен.", auto_delete_after=FEED_NOTICE_DELETE_SECONDS)
         return
     if int(cat["fish"]) < 1:
-        send(chat_id, "😿 Нет рыбки. Каждые 5 сообщений дают одну; максимум — 3 за день.")
+        send(
+            chat_id,
+            "😿 Нет рыбки. Каждые 5 сообщений дают одну; максимум — 3 за день.",
+            auto_delete_after=FEED_NOTICE_DELETE_SECONDS,
+        )
         return
     from social_game import mood_bonus_for_cat
 
@@ -389,7 +394,7 @@ def _handle_feed(db: sqlite3.Connection, chat_id: int, user_id: int, send: GameS
         text += " 📅 Недельное задание выполнено! Награда добавлена."
     if levels_gained:
         text += f" 🎉 Новый уровень: {int(cat['level']) + levels_gained}!"
-    send(chat_id, text)
+    send(chat_id, text, auto_delete_after=FEED_NOTICE_DELETE_SECONDS)
 
 
 def _handle_care(
@@ -517,27 +522,31 @@ def handle_command(
     return True
 
 
-def record_group_message(
-    db: sqlite3.Connection, message: dict[str, Any], send: GameSender
-) -> None:
+def is_activity_message(message: dict[str, Any]) -> bool:
     user = message.get("from", {})
     if not user or user.get("is_bot"):
-        return
-    chat_id = int(message["chat"]["id"])
-    user_id = int(user["id"])
-    text = message.get("text", "")
+        return False
+    text = message.get("text", "") or ""
     if text.lstrip().startswith("/"):
-        return
-    meaningful = bool(
+        return False
+    return bool(
         text.strip()
-        or message.get("caption", "").strip()
+        or (message.get("caption", "") or "").strip()
         or any(
             key in message
             for key in ("photo", "video", "audio", "voice", "document", "sticker", "animation", "video_note")
         )
     )
-    if not meaningful:
+
+
+def record_group_message(
+    db: sqlite3.Connection, message: dict[str, Any], send: GameSender
+) -> None:
+    if not is_activity_message(message):
         return
+    user = message.get("from", {})
+    chat_id = int(message["chat"]["id"])
+    user_id = int(user["id"])
     cat, _, notices = _prepare_cat(db, chat_id, user_id)
     _send_notices(send, chat_id, notices)
     if not cat:
