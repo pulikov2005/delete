@@ -1000,6 +1000,7 @@ def handle_group_command(
             "🐱 <code>/cat Имя</code> — завести котика с именем или посмотреть своего.\n"
             "<code>/rename Имя</code> — переименовать котика; цена — 10 камушков. <code>/task</code> — ежедневное задание.\n"
             "<code>/feed</code> — потратить рыбку и повысить настроение на 1; активный мини-котёнок средней редкости даёт ещё +1.\n"
+            "<code>/fishing</code> — раз в день попробовать поймать камушек: шанс находки 70%, шанс пустой рыбалки — 30%.\n"
             "<code>/brush</code>, <code>/clean</code> — уход; <code>/train сила</code> — тренировка за камушки.\n"
             "\n"
             "<b>Отношения</b>\n"
@@ -1445,6 +1446,7 @@ def main() -> None:
                 {"command": "leaderboard", "description": "Таблица лидеров за неделю"},
                 {"command": "task", "description": "Показать ежедневное задание котика"},
                 {"command": "feed", "description": "Покормить котика рыбкой"},
+                {"command": "fishing", "description": "Попробовать поймать камушек раз в день"},
                 {"command": "brush", "description": "Расчесать котика"},
                 {"command": "clean", "description": "Убрать лоток или сюрприз"},
                 {"command": "train", "description": "Прокачать характеристику за камушки"},
@@ -1465,7 +1467,7 @@ def main() -> None:
                 logging.exception("Could not publish scheduled quiz questions")
             updates = api(
                 "getUpdates",
-                {"offset": offset, "timeout": 30, "allowed_updates": ["message", "callback_query"]},
+                {"offset": offset, "timeout": 5, "allowed_updates": ["message", "callback_query"]},
             )
             for update in updates:
                 offset = max(offset, int(update["update_id"]) + 1)

@@ -14,6 +14,8 @@ MAX_LEVEL = 20
 MAX_FISH = 12
 MAX_MOOD = 10
 FEED_NOTICE_DELETE_SECONDS = 10
+FISH_NOTICE_DELETE_SECONDS = 15
+STONE_FISHING_SUCCESS_CHANCE = 0.70
 TASK_CHANCE = 0.35
 RENAME_COST = 10
 PERSONALITIES = ("Любознательный", "Игривый", "Ласковый", "Шустрый", "Упорный")
@@ -93,6 +95,12 @@ def setup_db(db: sqlite3.Connection) -> None:
             fish_earned INTEGER NOT NULL DEFAULT 0,
             finalized INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(cat_id, day)
+        );
+        CREATE TABLE IF NOT EXISTS stone_fishing_claims (
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            day TEXT NOT NULL,
+            PRIMARY KEY(chat_id,user_id,day)
         );
         """
     )
@@ -457,6 +465,36 @@ def _handle_train(
     send(chat_id, f"🏋️ {emoji} {display_name.capitalize()}: {current} → {new_value}. Потрачено {cost} камушков.{extra}")
 
 
+def _handle_stone_fishing(
+    db: sqlite3.Connection, chat_id: int, user_id: int, args: list[str], send: GameSender
+) -> None:
+    if args:
+        send(chat_id, "Рыбалка запускается без параметров: /fishing.")
+        return
+    cat = _current_cat(db, chat_id, user_id)
+    if not cat:
+        send(chat_id, "Сначала заведи котика командой /cat Имя.")
+        return
+
+    day = _today().isoformat()
+    cursor = db.execute(
+        "INSERT OR IGNORE INTO stone_fishing_claims(chat_id,user_id,day) VALUES(?,?,?)",
+        (chat_id, user_id, day),
+    )
+    if cursor.rowcount == 0:
+        send(chat_id, "🎣 Сегодня котик уже рыбачил. Следующая попытка будет завтра.")
+        return
+
+    found_stone = random.random() < STONE_FISHING_SUCCESS_CHANCE
+    if found_stone:
+        db.execute("UPDATE cats SET stones=stones+1 WHERE cat_id=?", (cat["cat_id"],))
+        db.commit()
+        send(chat_id, f"🎣 {cat['name']} вытащил камушек! +1 камушек. Теперь у котика {int(cat['stones']) + 1}.")
+    else:
+        db.commit()
+        send(chat_id, f"🐟 {cat['name']} сегодня ничего не поймал. Попробуй снова завтра!")
+
+
 def handle_command(
     db: sqlite3.Connection,
     message: dict[str, Any],
@@ -464,7 +502,7 @@ def handle_command(
     args: list[str],
     send: GameSender,
 ) -> bool:
-    if command not in {"cat", "rename", "task", "feed", "brush", "clean", "train"}:
+    if command not in {"cat", "rename", "task", "feed", "brush", "clean", "train", "fishing"}:
         return False
     chat_id = int(message["chat"]["id"])
     user_id = int(message.get("from", {}).get("id", 0))
@@ -515,6 +553,8 @@ def handle_command(
             send(chat_id, "Сначала заведи котика командой /cat.")
     elif command == "feed":
         _handle_feed(db, chat_id, user_id, send)
+    elif command == "fishing":
+        _handle_stone_fishing(db, chat_id, user_id, args, send)
     elif command in ("brush", "clean"):
         _handle_care(db, chat_id, user_id, command, send)
     elif command == "train":
@@ -568,9 +608,17 @@ def record_group_message(
         )
         db.commit()
         if stored:
-            send(chat_id, f"🐟 {cat['color'].capitalize()} котик нашёл рыбку! В запасе: {int(cat['fish']) + stored}/{MAX_FISH}.")
+            send(
+                chat_id,
+                f"🐟 {cat['color'].capitalize()} котик нашёл рыбку! В запасе: {int(cat['fish']) + stored}/{MAX_FISH}.",
+                auto_delete_after=FISH_NOTICE_DELETE_SECONDS,
+            )
         else:
-            send(chat_id, f"🐟 Запас рыбок у {cat['name']} полон ({MAX_FISH}); новая рыбка не поместилась.")
+            send(
+                chat_id,
+                f"🐟 Запас рыбок у {cat['name']} полон ({MAX_FISH}); новая рыбка не поместилась.",
+                auto_delete_after=FISH_NOTICE_DELETE_SECONDS,
+            )
     else:
         db.execute(
             "UPDATE cat_days SET message_count=? WHERE cat_id=? AND day=?",
