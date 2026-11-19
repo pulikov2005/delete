@@ -7,6 +7,7 @@ import logging
 import random
 import sqlite3
 import time
+import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
@@ -231,16 +232,84 @@ def setup_db(db: sqlite3.Connection) -> None:
             completed INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(chat_id,user_id,day)
         );
+        CREATE TABLE IF NOT EXISTS play_setups (
+            setup_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            game_type TEXT NOT NULL,
+            stake INTEGER,
+            board_size INTEGER NOT NULL DEFAULT 3,
+            message_id INTEGER,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS public_game_lobbies (
+            lobby_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            owner_id INTEGER NOT NULL,
+            game_type TEXT NOT NULL,
+            stake INTEGER NOT NULL,
+            board_size INTEGER NOT NULL DEFAULT 3,
+            status TEXT NOT NULL DEFAULT 'open',
+            message_id INTEGER,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS public_game_lobbies_open
+            ON public_game_lobbies(chat_id,status,expires_at);
+        CREATE TABLE IF NOT EXISTS logic_games (
+            logic_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            player_a INTEGER NOT NULL,
+            player_b INTEGER NOT NULL,
+            stake INTEGER NOT NULL,
+            question TEXT NOT NULL,
+            answers_json TEXT NOT NULL,
+            questions_json TEXT NOT NULL DEFAULT '[]',
+            round_index INTEGER NOT NULL DEFAULT 1,
+            score_a INTEGER NOT NULL DEFAULT 0,
+            score_b INTEGER NOT NULL DEFAULT 0,
+            message_id INTEGER,
+            state TEXT NOT NULL DEFAULT 'active',
+            created_at INTEGER NOT NULL
+        );
         """
     )
+    ttt_columns = {row["name"] for row in db.execute("PRAGMA table_info(ttt_games)").fetchall()}
+    if "board_size" not in ttt_columns:
+        db.execute("ALTER TABLE ttt_games ADD COLUMN board_size INTEGER NOT NULL DEFAULT 3")
+    if "board_message_id" not in ttt_columns:
+        db.execute("ALTER TABLE ttt_games ADD COLUMN board_message_id INTEGER")
+    if "last_action_at" not in ttt_columns:
+        db.execute("ALTER TABLE ttt_games ADD COLUMN last_action_at INTEGER NOT NULL DEFAULT 0")
+    play_setup_columns = {row["name"] for row in db.execute("PRAGMA table_info(play_setups)").fetchall()}
+    if "message_id" not in play_setup_columns:
+        db.execute("ALTER TABLE play_setups ADD COLUMN message_id INTEGER")
+    logic_columns = {row["name"] for row in db.execute("PRAGMA table_info(logic_games)").fetchall()}
+    for column, definition in (
+        ("questions_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("round_index", "INTEGER NOT NULL DEFAULT 1"),
+        ("score_a", "INTEGER NOT NULL DEFAULT 0"),
+        ("score_b", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if column not in logic_columns:
+            db.execute(f"ALTER TABLE logic_games ADD COLUMN {column} {definition}")
+    old_logic = db.execute(
+        "SELECT logic_id,question,answers_json FROM logic_games WHERE questions_json='[]'"
+    ).fetchall()
+    for row in old_logic:
+        db.execute(
+            "UPDATE logic_games SET questions_json=? WHERE logic_id=?",
+            (json.dumps([{"question": row["question"], "answers": json.loads(row["answers_json"])}], ensure_ascii=False), row["logic_id"]),
+        )
+    db.execute("UPDATE weekly_quests SET kind='games',target=2,progress=MIN(progress,2) WHERE kind='quiz' AND completed=0")
     db.commit()
 
 
 WEEKLY_QUESTS = {
     "messages": ("Напиши 25 сообщений в беседе", 25),
-    "care": ("Выполни 3 задания по уходу за котиком", 3),
+    "care": ("Выполни 3 выпавших ежедневных задания по уходу", 3),
     "games": ("Сыграй в 2 мини-игры", 2),
-    "quiz": ("Ответь на все 3 вопроса общей викторины", 1),
 }
 QUIZ_QUESTIONS = (
     ("Как называют детёныша кошки?", ("Котёнок", "Щенок", "Жеребёнок"), 1),
@@ -255,6 +324,24 @@ QUIZ_QUESTIONS = (
     ("Как называется врач для животных?", ("Ветеринар", "Повар", "Пилот"), 1),
     ("Что кошке нужно для безопасной игры?", ("Игрушка", "Стекло", "Открытое окно"), 1),
     ("Какой орган кошка часто использует для умывания?", ("Язык", "Локоть", "Колено"), 1),
+)
+
+LOGIC_QUESTIONS = (
+    ("Продолжи ряд: 2, 4, 8, 16, ?", ("32",)),
+    ("Сколько месяцев в году имеют 28 дней?", ("12", "двенадцать")),
+    ("Что принадлежит тебе, но другие произносят это чаще тебя?", ("имя", "моё имя", "мое имя")),
+    ("У стола четыре угла. Один угол отпилили. Сколько углов стало?", ("5", "пять")),
+    ("Продолжи ряд Фибоначчи: 1, 1, 2, 3, 5, ?", ("8", "восемь")),
+    ("Сколько будет 60 + 25?", ("85", "восемьдесят пять")),
+    ("Что тяжелее: килограмм железа или килограмм пуха?", ("одинаково", "одинаковый вес", "одинаковый")),
+    ("У двух отцов и двух сыновей три яблока, каждому досталось по одному. Сколько их было?", ("3", "три")),
+    ("Какое число лишнее: 2, 4, 6, 9, 10?", ("9", "девять")),
+    ("Столица Франции?", ("париж",)),
+    ("Столица Японии?", ("токио",)),
+    ("Сколько сторон у шестиугольника?", ("6", "шесть")),
+    ("Продолжи ряд: 1, 4, 9, 16, ?", ("25", "двадцать пять")),
+    ("Что можно увидеть с закрытыми глазами?", ("сон", "сны")),
+    ("В корзине 5 яблок. Как раздать их пяти детям, оставив одно яблоко в корзине?", ("отдать яблоко вместе с корзиной", "с корзиной", "корзину")),
 )
 
 
@@ -293,10 +380,14 @@ def weekly_status(db: sqlite3.Connection, chat_id: int, user_id: int) -> str:
     progress = min(int(quest["progress"]), int(quest["target"]))
     state = "✅ выполнено" if quest["completed"] else f"{progress}/{quest['target']}"
     stones = 10 + (2 if cat["personality"] == "Упорный" else 0)
+    guidance = (
+        "Засчитываются только задания, которые выпали и показаны в /task; там же нажми кнопку нужного действия."
+        if str(quest["kind"]) == "care" else "Выполненные задания также добавляют очки в /leaderboard."
+    )
     return (
         f"📅 Недельное задание для {cat['name']}\n{title}: {state}\n"
         f"Награда: +8 XP и +{stones} камушков. Сброс — в понедельник.\n"
-        "Выполненные задания также добавляют очки в /leaderboard."
+        f"{guidance}"
     )
 
 
@@ -366,7 +457,10 @@ def record_weekly_event(
         if newly_completed:
             fresh_cat = db.execute("SELECT * FROM cats WHERE cat_id=?", (cat_id,)).fetchone()
             extra_stones = 2 if fresh_cat["personality"] == "Упорный" else 0
-            game._add_progress(db, fresh_cat, xp=8, stones=10 + extra_stones)
+            game._add_progress(
+                db, fresh_cat, xp=8, stones=10 + extra_stones,
+                stone_source="недельное задание", actor_id=int(fresh_cat["user_id"]),
+            )
             db.execute(
                 "UPDATE weekly_stats SET points=points+10 WHERE cat_id=? AND week_start=?",
                 (cat_id, week),
@@ -375,20 +469,26 @@ def record_weekly_event(
     return newly_completed
 
 
-def weekly_leaderboard(db: sqlite3.Connection, chat_id: int) -> str:
-    week = _week_start().isoformat()
+def leaderboard(db: sqlite3.Connection, chat_id: int) -> str:
     rows = db.execute(
-        "SELECT c.name,c.personality,c.level,s.points FROM weekly_stats s "
-        "JOIN cats c ON c.cat_id=s.cat_id WHERE s.chat_id=? AND s.week_start=? "
-        "ORDER BY s.points DESC,c.total_xp DESC,c.cat_id ASC LIMIT 10",
-        (chat_id, week),
+        "SELECT c.name,c.personality,c.level,c.total_xp,"
+        "COALESCE(SUM(s.points),0) AS points,COALESCE(SUM(s.messages),0) AS messages,"
+        "COALESCE(SUM(s.care_done),0) AS care_done,COALESCE(SUM(s.games_played),0) AS games_played "
+        "FROM cats c LEFT JOIN weekly_stats s ON s.cat_id=c.cat_id AND s.chat_id=c.chat_id "
+        "WHERE c.chat_id=? AND c.cat_id=("
+        "SELECT MAX(c2.cat_id) FROM cats c2 WHERE c2.chat_id=c.chat_id AND c2.user_id=c.user_id) "
+        "GROUP BY c.cat_id HAVING COALESCE(SUM(s.points),0)>0 "
+        "ORDER BY points DESC,c.total_xp DESC,c.cat_id ASC LIMIT 10",
+        (chat_id,),
     ).fetchall()
     if not rows:
-        return "🏆 Недельная таблица пока пуста. Начни с /weekly, ухода, викторины или мини-игры."
-    lines = ["🏆 Таблица лидеров этой недели"]
+        return "🏆 Таблица лидеров за всё время пока пуста. Начни с сообщений, ухода или мини-игры."
+    lines = ["🏆 Таблица лидеров за всё время", "Очки и статистика не сбрасываются вместе с недельным заданием."]
     medals = ("🥇", "🥈", "🥉")
     lines.extend(
-        f"{medals[index] if index < 3 else f'{index + 1}.'} {row['name']} — {row['points']} очк. · ур. {row['level']} · {row['personality']}"
+        f"{medals[index] if index < 3 else f'{index + 1}.'} {row['name']} — {row['points']} очк. · "
+        f"{row['messages']} сообщ. · уход {row['care_done']} · игр {row['games_played']} · "
+        f"ур. {row['level']} · {row['personality']}"
         for index, row in enumerate(rows)
     )
     return "\n".join(lines)
@@ -554,7 +654,7 @@ def _submit_quiz_answer(
         ).fetchone()["winner_user_id"] == user_id
     )
     if first_correct:
-        game._add_progress(db, cat, xp=1, stones=2)
+        game._add_progress(db, cat, xp=1, stones=2, stone_source="первая победа в викторине", actor_id=user_id)
     if completed_now:
         db.execute(
             "UPDATE daily_quiz_results SET completed=1 WHERE chat_id=? AND user_id=? AND day=? AND completed=0",
@@ -668,7 +768,10 @@ def finalize_auto_feed(
     )
     if task_needs_reward:
         extra_xp, extra_stones = task_bonus_for_cat(db, cat)
-        game._add_progress(db, cat, xp=3 + extra_xp, stones=2 + extra_stones)
+        game._add_progress(
+            db, cat, xp=3 + extra_xp, stones=2 + extra_stones,
+            stone_source="ежедневное задание", actor_id=int(cat["user_id"]),
+        )
         record_weekly_event(db, cat, "care")
     return db.execute(
         "SELECT * FROM cat_days WHERE cat_id=? AND day=?",
@@ -1044,9 +1147,8 @@ def _marriage_command(
             send(chat_id, f"Для свадьбы каждому нужно {MARRIAGE_COST} камушков. Пока предложение остаётся открытым.")
             return
         db.execute(
-            "UPDATE cats SET stones=stones-? WHERE cat_id IN (?,?)",
-            (MARRIAGE_COST, proposer_cat["cat_id"], acceptor_cat["cat_id"]),
-        )
+        game.change_stones(db, proposer_cat, -MARRIAGE_COST, "свадьба", proposer)
+        game.change_stones(db, acceptor_cat, -MARRIAGE_COST, "свадьба", user_id)
         db.execute(
             "UPDATE marriages SET status='married',married_on=?,ended_on=NULL WHERE chat_id=? AND user_a=? AND user_b=?",
             (today.isoformat(), chat_id, proposal["user_a"], proposal["user_b"]),
@@ -1366,7 +1468,7 @@ def _item_command(
         if int(cat["stones"]) < cost:
             send(chat_id, f"{title} стоит {cost} камушков, сейчас у котика {cat['stones']}.")
             return
-        db.execute("UPDATE cats SET stones=stones-? WHERE cat_id=?", (cost, cat["cat_id"]))
+        game.change_stones(db, cat, -cost, "покупка предмета", user_id, ITEMS[key][0])
         db.execute(
             "INSERT INTO cat_items(cat_id,item_key,quantity) VALUES(?,?,1) "
             "ON CONFLICT(cat_id,item_key) DO UPDATE SET quantity=quantity+1",
@@ -1444,7 +1546,15 @@ def _has_open_game(db: sqlite3.Connection, chat_id: int, user_id: int) -> bool:
         "SELECT 1 FROM race_games WHERE chat_id=? AND state='pending' AND (player_a=? OR player_b=?) LIMIT 1",
         (chat_id, user_id, user_id),
     ).fetchone()
-    return bool(ttt or race)
+    logic = db.execute(
+        "SELECT 1 FROM logic_games WHERE chat_id=? AND state='active' AND (player_a=? OR player_b=?) LIMIT 1",
+        (chat_id, user_id, user_id),
+    ).fetchone()
+    lobby = db.execute(
+        "SELECT 1 FROM public_game_lobbies WHERE chat_id=? AND owner_id=? AND status='open' AND expires_at>? LIMIT 1",
+        (chat_id, user_id, int(time.time())),
+    ).fetchone()
+    return bool(ttt or race or logic or lobby)
 
 
 def _game_cats_for_challenge(
@@ -1707,12 +1817,12 @@ def _settle_game(db: sqlite3.Connection, row: sqlite3.Row, winner_id: int | None
         for user_id in (int(row["player_x"]), int(row["player_o"])):
             cat = _current_cat(db, chat_id, user_id)
             if cat:
-                db.execute("UPDATE cats SET stones=stones+? WHERE cat_id=?", (stake, cat["cat_id"]))
+                game.change_stones(db, cat, stake, "возврат ставки: крестики-нолики", details="ничья")
         text = f"🤝 Ничья! Камушки возвращены игрокам: по {stake} каждому."
     else:
         winner_cat = _current_cat(db, chat_id, winner_id)
         if winner_cat:
-            db.execute("UPDATE cats SET stones=stones+? WHERE cat_id=?", (stake * 2, winner_cat["cat_id"]))
+            game.change_stones(db, winner_cat, stake * 2, "победа: крестики-нолики", winner_id)
         loser_id = int(row["player_o"] if winner_id == int(row["player_x"]) else row["player_x"])
         text = f"🏆 {_display_user(db, chat_id, winner_id)} выиграл(а) {stake * 2} камушков у {_display_user(db, chat_id, loser_id)}!"
     db.execute("UPDATE ttt_games SET state='finished',turn_user=NULL WHERE game_id=?", (row["game_id"],))
@@ -1730,7 +1840,8 @@ def _settle_game(db: sqlite3.Connection, row: sqlite3.Row, winner_id: int | None
 
 
 def _ttt_command(
-    db: sqlite3.Connection, message: dict[str, Any], command: str, args: list[str], send: GameSender
+    db: sqlite3.Connection, message: dict[str, Any], command: str, args: list[str], send: GameSender,
+    edit_message: Callable[..., Any] | None = None,
 ) -> None:
     chat_id = int(message["chat"]["id"])
     user_id = int(message.get("from", {}).get("id", 0))
@@ -1803,7 +1914,8 @@ def _ttt_command(
             db.commit()
             send(chat_id, "Приглашение закрыто: одному из игроков уже не хватает камушков на ставку.")
             return
-        db.execute("UPDATE cats SET stones=stones-? WHERE cat_id IN (?,?)", (stake, cat_x["cat_id"], cat_o["cat_id"]))
+        game.change_stones(db, cat_x, -stake, "ставка: крестики-нолики", player_x)
+        game.change_stones(db, cat_o, -stake, "ставка: крестики-нолики", user_id)
         db.execute(
             "UPDATE ttt_games SET state='active',board='.........',turn_user=? WHERE game_id=?",
             (player_x, row["game_id"]),
@@ -1815,15 +1927,61 @@ def _ttt_command(
     if command == "resign":
         row = _game_for_user(db, chat_id, user_id, "active")
         if not row:
+            logic = db.execute(
+                "SELECT * FROM logic_games WHERE chat_id=? AND state='active' AND (player_a=? OR player_b=?) "
+                "ORDER BY logic_id DESC LIMIT 1",
+                (chat_id, user_id, user_id),
+            ).fetchone()
+            if logic:
+                winner_id = int(logic["player_b"] if user_id == int(logic["player_a"]) else logic["player_a"])
+                winner_cat = _current_cat(db, chat_id, winner_id)
+                if winner_cat:
+                    game.change_stones(db, winner_cat, int(logic["stake"]) * 2, "победа: логическая дуэль", winner_id, "соперник покинул игру")
+                db.execute("UPDATE logic_games SET state='finished' WHERE logic_id=?", (logic["logic_id"],))
+                db.execute(
+                    "UPDATE public_game_lobbies SET status='finished' WHERE chat_id=? AND message_id=? AND status='active'",
+                    (chat_id, logic["message_id"]),
+                )
+                db.commit()
+                if edit_message:
+                    edit_message(
+                        chat_id, int(logic["message_id"] or 0),
+                        f"🏁 {_display_user(db, chat_id, user_id)} покинул логическую дуэль. "
+                        f"Победил {_display_user(db, chat_id, winner_id)} и получает {int(logic['stake']) * 2} камушков.",
+                        {"inline_keyboard": []},
+                    )
+                    _schedule_game_cleanup(db, chat_id, int(logic["message_id"] or 0))
+                send(chat_id, "Ты покинул логическую дуэль.")
+                for player_id in (int(logic["player_a"]), int(logic["player_b"])):
+                    participant = _current_cat(db, chat_id, player_id)
+                    if participant:
+                        record_weekly_event(db, participant, "games", winner=player_id == winner_id)
+                return
             send(chat_id, "У тебя сейчас нет активной партии.")
             return
         winner_id = int(row["player_o"] if user_id == int(row["player_x"]) else row["player_x"])
         _settle_game(db, row, winner_id, send, "Соперник завершил партию досрочно.")
+        if row["board_message_id"] and edit_message:
+            db.execute(
+                "UPDATE public_game_lobbies SET status='finished' WHERE chat_id=? AND message_id=? AND status='active'",
+                (chat_id, row["board_message_id"]),
+            )
+            db.commit()
+            final_row = db.execute("SELECT * FROM ttt_games WHERE game_id=?", (row["game_id"],)).fetchone()
+            edit_message(
+                chat_id, int(row["board_message_id"]),
+                _ttt_status(db, final_row) + f"\n\nПартия завершена досрочно. Победил {_display_user(db, chat_id, winner_id)}.",
+                {"inline_keyboard": []},
+            )
+            _schedule_game_cleanup(db, chat_id, int(row["board_message_id"]))
         return
 
     row = _game_for_user(db, chat_id, user_id, "active")
     if not row:
         send(chat_id, "У тебя сейчас нет активной партии.")
+        return
+    if row["board_message_id"]:
+        send(chat_id, "В этой партии ход делается нажатием на клетку в сообщении с игровым полем.")
         return
     if int(row["turn_user"] or 0) != user_id:
         send(chat_id, "Сейчас ход соперника.")
@@ -1884,18 +2042,18 @@ def _race_invitation_reply(
         return
     score_a = int(cat_a["agility"]) * 3 + int(cat_a["luck"]) + random.randint(1, 12) + (2 if cat_a["personality"] == "Шустрый" else 0)
     score_b = int(cat_b["agility"]) * 3 + int(cat_b["luck"]) + random.randint(1, 12) + (2 if cat_b["personality"] == "Шустрый" else 0)
-    db.execute(
-        "UPDATE cats SET stones=stones-? WHERE cat_id IN (?,?)",
-        (stake, cat_a["cat_id"], cat_b["cat_id"]),
-    )
+    game.change_stones(db, cat_a, -stake, "ставка: котогонка", player_a)
+    game.change_stones(db, cat_b, -stake, "ставка: котогонка", player_b)
     winner_id: int | None = None
     if score_a == score_b:
-        db.execute("UPDATE cats SET stones=stones+? WHERE cat_id IN (?,?)", (stake, cat_a["cat_id"], cat_b["cat_id"]))
+        game.change_stones(db, cat_a, stake, "возврат ставки: котогонка", details="ничья")
+        game.change_stones(db, cat_b, stake, "возврат ставки: котогонка", details="ничья")
         result = f"🤝 Ничья в котогонке! Камушки возвращены. Счёт: {score_a}:{score_b}."
     else:
         winner_id = player_a if score_a > score_b else player_b
         winner_cat_id = cat_a["cat_id"] if score_a > score_b else cat_b["cat_id"]
-        db.execute("UPDATE cats SET stones=stones+? WHERE cat_id=?", (stake * 2, winner_cat_id))
+        winner_cat = cat_a if score_a > score_b else cat_b
+        game.change_stones(db, winner_cat, stake * 2, "победа: котогонка", winner_id)
         result = (
             f"🏁 {_display_user(db, chat_id, winner_id)} выиграл(а) котогонку и получает "
             f"{stake * 2} камушков! Счёт: {score_a}:{score_b}."
@@ -1931,20 +2089,597 @@ def _race_command(
     _start_game_invitation(db, chat_id, user_id, target_id, "race", stake, send)
 
 
+PLAY_NAMES = {"ttt": "крестики-нолики", "race": "котогонка", "logic": "логическая дуэль"}
+PLAY_STAKES = (1, 5, 10, 20, 50, 100, 200, 500, 1000)
+PLAY_SETUP_TTL = 5 * 60
+PUBLIC_LOBBY_TTL = 15 * 60
+PUBLIC_LOGIC_TTL = 10 * 60
+PUBLIC_TTT_TURN_TTL = 30 * 60
+
+
+def _play_keyboard(rows: list[list[dict[str, str]]]) -> dict[str, Any]:
+    return {"inline_keyboard": rows}
+
+
+def _edit_game_message(
+    edit_message: Callable[..., Any], chat_id: int, message_id: int, text: str,
+    keyboard: dict[str, Any] | None = None,
+) -> None:
+    edit_message(chat_id, message_id, text, keyboard)
+
+
+def _schedule_game_cleanup(db: sqlite3.Connection, chat_id: int, message_id: int, delay: int = 120) -> None:
+    exists = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='auto_delete_messages'"
+    ).fetchone()
+    if not exists:
+        return
+    db.execute(
+        "INSERT OR REPLACE INTO auto_delete_messages(chat_id,message_id,delete_at,attempts) VALUES(?,?,?,0)",
+        (chat_id, message_id, int(time.time()) + delay),
+    )
+    db.commit()
+
+
+def _user_has_active_game(db: sqlite3.Connection, chat_id: int, user_id: int) -> bool:
+    checks = (
+        ("SELECT 1 FROM ttt_games WHERE chat_id=? AND state IN ('pending','active') AND (player_x=? OR player_o=?) LIMIT 1", (chat_id, user_id, user_id)),
+        ("SELECT 1 FROM race_games WHERE chat_id=? AND state='pending' AND (player_a=? OR player_b=?) LIMIT 1", (chat_id, user_id, user_id)),
+        ("SELECT 1 FROM logic_games WHERE chat_id=? AND state='active' AND (player_a=? OR player_b=?) LIMIT 1", (chat_id, user_id, user_id)),
+    )
+    return any(db.execute(sql, params).fetchone() for sql, params in checks)
+
+
+def _play_menu(db: sqlite3.Connection, chat_id: int, user_id: int, send: GameSender) -> None:
+    cat = _current_cat(db, chat_id, user_id)
+    if not cat:
+        send(chat_id, "Сначала заведи котика командой /cat ИМЯ.")
+        return
+    if _user_has_active_game(db, chat_id, user_id):
+        send(chat_id, "Сначала закончи свою текущую игру.")
+        return
+    send(
+        chat_id,
+        f"🎮 Игры котика {cat['name']}\nВыбери игру:",
+        reply_markup=_play_keyboard([
+            [{"text": "❎⭕ Крестики-нолики", "callback_data": f"pm:game:{user_id}:ttt"}],
+            [{"text": "🏁 Котогонка", "callback_data": f"pm:game:{user_id}:race"}],
+            [{"text": "💡 Логическая дуэль", "callback_data": f"pm:game:{user_id}:logic"}],
+        ]),
+        auto_delete_after=PLAY_SETUP_TTL,
+    )
+
+
+def _normalize_answer(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value).casefold().replace("ё", "е")
+    value = "".join(char if char.isalnum() or char.isspace() else " " for char in value)
+    return " ".join(value.split())
+
+
+def _ttt_lines(size: int) -> list[tuple[int, ...]]:
+    needed = size if size == 3 else 4
+    lines: list[tuple[int, ...]] = []
+    for row in range(size):
+        for col in range(size):
+            if col + needed <= size:
+                lines.append(tuple(row * size + col + offset for offset in range(needed)))
+            if row + needed <= size:
+                lines.append(tuple((row + offset) * size + col for offset in range(needed)))
+            if row + needed <= size and col + needed <= size:
+                lines.append(tuple((row + offset) * size + col + offset for offset in range(needed)))
+            if row + needed <= size and col - needed + 1 >= 0:
+                lines.append(tuple((row + offset) * size + col - offset for offset in range(needed)))
+    return lines
+
+
+def _ttt_winner(board: str, size: int) -> str | None:
+    for line in _ttt_lines(size):
+        mark = board[line[0]]
+        if mark != "." and all(board[index] == mark for index in line):
+            return mark
+    return None
+
+
+def _ttt_markup(row: sqlite3.Row) -> dict[str, Any]:
+    size = int(row["board_size"] or 3)
+    board = str(row["board"])
+    symbols = {"X": "❌", "O": "⭕", ".": "▫️"}
+    rows = []
+    for r in range(size):
+        rows.append([
+            {"text": symbols[board[r * size + c]], "callback_data": f"pm:cell:{row['game_id']}:{r * size + c}"}
+            for c in range(size)
+        ])
+    return _play_keyboard(rows)
+
+
+def _ttt_status(db: sqlite3.Connection, row: sqlite3.Row) -> str:
+    turn = int(row["turn_user"] or 0)
+    text = (
+        f"❎⭕ Крестики-нолики {row['board_size']}×{row['board_size']} · ставка {row['stake']} камушков с каждого\n"
+        f"❌ {_display_user(db, int(row['chat_id']), int(row['player_x']))} против "
+        f"⭕ {_display_user(db, int(row['chat_id']), int(row['player_o']))}"
+    )
+    if turn:
+        text += f"\nХод: {_display_user(db, int(row['chat_id']), turn)}"
+    return text
+
+
+def _publish_public_lobby(
+    db: sqlite3.Connection, setup: sqlite3.Row, send: GameSender,
+    edit_message: Callable[..., Any],
+) -> bool:
+    chat_id, user_id = int(setup["chat_id"]), int(setup["user_id"])
+    cat = _current_cat(db, chat_id, user_id)
+    if not cat or int(cat["stones"]) < int(setup["stake"]):
+        send(chat_id, "Не хватает камушков на такую ставку.")
+        return False
+    if _user_has_active_game(db, chat_id, user_id):
+        send(chat_id, "У тебя уже есть незавершённая игра.")
+        return False
+    open_lobby = db.execute(
+        "SELECT 1 FROM public_game_lobbies WHERE chat_id=? AND owner_id=? AND status='open' AND expires_at>? LIMIT 1",
+        (chat_id, user_id, int(time.time())),
+    ).fetchone()
+    if open_lobby:
+        send(chat_id, "У тебя уже есть открытый игровой вызов.")
+        return False
+    now = int(time.time())
+    cursor = db.execute(
+        "INSERT INTO public_game_lobbies(chat_id,owner_id,game_type,stake,board_size,status,message_id,created_at,expires_at) "
+        "VALUES(?,?,?,?,?,'open',?,?,?)",
+        (chat_id, user_id, setup["game_type"], int(setup["stake"]), int(setup["board_size"]), setup["message_id"], now, now + PUBLIC_LOBBY_TTL),
+    )
+    lobby_id = int(cursor.lastrowid)
+    db.execute("DELETE FROM play_setups WHERE setup_id=?", (setup["setup_id"],))
+    db.commit()
+    game_label = PLAY_NAMES[str(setup["game_type"])]
+    options = f" · поле {setup['board_size']}×{setup['board_size']}" if setup["game_type"] == "ttt" else ""
+    text = (
+        f"🐱 Котёнок {cat['name']} запустил игру «{game_label}»{options}!\n"
+        f"Ставка: {setup['stake']} камушков с каждого. Кто желает — присоединяйтесь!\n"
+        "Первый участник, нажавший кнопку, станет соперником. Вызов действует 15 минут."
+    )
+    message_id = int(setup["message_id"] or 0)
+    try:
+        _edit_game_message(
+            edit_message, chat_id, message_id, text,
+            _play_keyboard([
+                [{"text": "🐾 Присоединиться", "callback_data": f"pm:join:{lobby_id}"}],
+                [{"text": "Отменить свой вызов", "callback_data": f"pm:cancel_lobby:{lobby_id}"}],
+            ]),
+        )
+        _schedule_game_cleanup(db, chat_id, message_id, PUBLIC_LOBBY_TTL + 120)
+    except Exception:
+        db.execute("UPDATE public_game_lobbies SET status='failed' WHERE lobby_id=?", (lobby_id,))
+        db.commit()
+        raise
+    return True
+
+
+def _handle_join_lobby(
+    db: sqlite3.Connection, lobby: sqlite3.Row, user_id: int, send: GameSender,
+    edit_message: Callable[..., Any], answer_callback: Callable[[str, str], Any], query_id: str,
+) -> None:
+    chat_id = int(lobby["chat_id"])
+    owner_id = int(lobby["owner_id"])
+    message_id = int(lobby["message_id"] or 0)
+    if int(lobby["expires_at"]) <= int(time.time()):
+        db.execute("UPDATE public_game_lobbies SET status='expired' WHERE lobby_id=?", (lobby["lobby_id"],))
+        db.commit()
+        answer_callback(query_id, "Время игры вышло. Создай новое приглашение через /play.")
+        _edit_game_message(edit_message, chat_id, message_id, "⌛ Время ожидания соперника истекло.", {"inline_keyboard": []})
+        return
+    if str(lobby["status"]) != "open":
+        answer_callback(query_id, "В эту игру уже присоединились.")
+        return
+    if user_id == owner_id:
+        answer_callback(query_id, "Это твоя игра — дождись соперника!")
+        return
+    owner_cat = _current_cat(db, chat_id, owner_id)
+    player_cat = _current_cat(db, chat_id, user_id)
+    if not owner_cat or not player_cat:
+        answer_callback(query_id, "Обоим игрокам сначала нужно создать котика командой /cat ИМЯ.")
+        return
+    stake = int(lobby["stake"])
+    if int(owner_cat["stones"]) < stake or int(player_cat["stones"]) < stake:
+        answer_callback(query_id, "Одному из игроков не хватает камушков на ставку.")
+        return
+    if _user_has_active_game(db, chat_id, user_id) or _user_has_active_game(db, chat_id, owner_id):
+        answer_callback(query_id, "Один из игроков уже участвует в другой игре.")
+        return
+    game_type = str(lobby["game_type"])
+    game.change_stones(db, owner_cat, -stake, f"ставка: {PLAY_NAMES[game_type]}", owner_id)
+    game.change_stones(db, player_cat, -stake, f"ставка: {PLAY_NAMES[game_type]}", user_id)
+    db.execute("UPDATE public_game_lobbies SET status='active' WHERE lobby_id=? AND status='open'", (lobby["lobby_id"],))
+    if game_type == "ttt":
+        size = int(lobby["board_size"])
+        cursor = db.execute(
+            "INSERT INTO ttt_games(chat_id,player_x,player_o,stake,state,board,turn_user,created_at,board_size,board_message_id,last_action_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (chat_id, owner_id, user_id, stake, "active", "." * (size * size), owner_id, datetime.now(timezone.utc).isoformat(), size, message_id, int(time.time())),
+        )
+        game_row = db.execute("SELECT * FROM ttt_games WHERE game_id=?", (cursor.lastrowid,)).fetchone()
+        db.commit()
+        _edit_game_message(edit_message, chat_id, message_id, _ttt_status(db, game_row), _ttt_markup(game_row))
+        _schedule_game_cleanup(db, chat_id, message_id, PUBLIC_TTT_TURN_TTL + 120)
+    elif game_type == "race":
+        score_a = int(owner_cat["agility"]) * 3 + int(owner_cat["luck"]) + random.randint(1, 12) + (2 if owner_cat["personality"] == "Шустрый" else 0)
+        score_b = int(player_cat["agility"]) * 3 + int(player_cat["luck"]) + random.randint(1, 12) + (2 if player_cat["personality"] == "Шустрый" else 0)
+        if score_a == score_b:
+            game.change_stones(db, owner_cat, stake, f"возврат ставки: {PLAY_NAMES[game_type]}", details="ничья")
+            game.change_stones(db, player_cat, stake, f"возврат ставки: {PLAY_NAMES[game_type]}", details="ничья")
+            result = f"🤝 Котогонка закончилась вничью! Ставки возвращены. Счёт: {score_a}:{score_b}."
+        else:
+            winner_id, winner_cat = (owner_id, owner_cat) if score_a > score_b else (user_id, player_cat)
+            game.change_stones(db, winner_cat, stake * 2, f"победа: {PLAY_NAMES[game_type]}")
+            result = f"🏁 {_display_user(db, chat_id, winner_id)} выиграл котогонку и получает {stake * 2} камушков! Счёт: {score_a}:{score_b}."
+        db.execute("UPDATE public_game_lobbies SET status='finished' WHERE lobby_id=?", (lobby["lobby_id"],))
+        db.commit()
+        _edit_game_message(edit_message, chat_id, message_id, result, {"inline_keyboard": []})
+        _schedule_game_cleanup(db, chat_id, message_id)
+        for participant_id in (owner_id, user_id):
+            participant_cat = _current_cat(db, chat_id, participant_id)
+            if participant_cat:
+                record_weekly_event(db, participant_cat, "games", winner=participant_id == winner_id if score_a != score_b else False)
+    else:
+        question_set = random.sample(LOGIC_QUESTIONS, k=min(5, len(LOGIC_QUESTIONS)))
+        question, answers = question_set[0]
+        db.execute(
+            "INSERT INTO logic_games(chat_id,player_a,player_b,stake,question,answers_json,questions_json,round_index,score_a,score_b,message_id,state,created_at) "
+            "VALUES(?,?,?,?,?,?,?,1,0,0,?,'active',?)",
+            (
+                chat_id, owner_id, user_id, stake, question,
+                json.dumps(answers, ensure_ascii=False),
+                json.dumps([{"question": q, "answers": a} for q, a in question_set], ensure_ascii=False),
+                message_id, int(time.time()),
+            ),
+        )
+        db.commit()
+        _edit_game_message(
+            edit_message, chat_id, message_id,
+            f"💡 Логическая дуэль · раунд 1/5\nСтавка: {stake} камушков с каждого.\n"
+            f"❔ {question}\n\nОба игрока пишут ответ прямо в чат. За каждый раунд очко получает первый верно ответивший.",
+            {"inline_keyboard": []},
+        )
+    answer_callback(query_id, "Игра началась!")
+
+
+def handle_play_callback(
+    db: sqlite3.Connection,
+    callback: dict[str, Any],
+    send: GameSender,
+    answer_callback: Callable[[str, str], Any],
+    edit_message: Callable[..., Any],
+) -> bool:
+    data = str(callback.get("data", ""))
+    if not data.startswith("pm:"):
+        return False
+    user_id = int(callback.get("from", {}).get("id", 0))
+    message = callback.get("message", {})
+    chat_id = int(message.get("chat", {}).get("id", 0))
+    message_id = int(message.get("message_id", 0))
+    query_id = str(callback.get("id", ""))
+    try:
+        parts = data.split(":")
+        action = parts[1]
+        if action == "game":
+            menu_owner = int(parts[2])
+            game_type = parts[3]
+            if menu_owner != user_id:
+                answer_callback(query_id, "Это меню открыл другой участник. Запусти своё командой /play.")
+                return True
+            if game_type not in PLAY_NAMES:
+                raise ValueError
+            cat = _current_cat(db, chat_id, user_id)
+            if not cat:
+                answer_callback(query_id, "Сначала заведи котика командой /cat ИМЯ.")
+                return True
+            if _user_has_active_game(db, chat_id, user_id):
+                answer_callback(query_id, "Сначала закончи свою текущую игру.")
+                return True
+            db.execute("DELETE FROM play_setups WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+            cursor = db.execute(
+                "INSERT INTO play_setups(chat_id,user_id,game_type,message_id,created_at,expires_at) VALUES(?,?,?,?,?,?)",
+                (chat_id, user_id, game_type, message_id, int(time.time()), int(time.time()) + PLAY_SETUP_TTL),
+            )
+            db.commit()
+            setup_id = int(cursor.lastrowid)
+            balance = int(cat["stones"])
+            choices = [value for value in PLAY_STAKES if value <= min(balance, MAX_STAKE)]
+            if balance and balance <= MAX_STAKE and balance not in choices:
+                choices.append(balance)
+            if not choices:
+                answer_callback(query_id, "Сначала заработай хотя бы 1 камушек на рыбалке или за задание.")
+                db.execute("DELETE FROM play_setups WHERE setup_id=?", (setup_id,))
+                db.commit()
+                return True
+            buttons = [[{"text": f"🪨 {value}", "callback_data": f"pm:stake:{setup_id}:{value}"} for value in choices[i:i + 3]] for i in range(0, len(choices), 3)]
+            buttons.append([{"text": "Отмена", "callback_data": f"pm:cancel:{setup_id}"}])
+            _edit_game_message(edit_message, chat_id, message_id, f"{PLAY_NAMES[game_type].capitalize()}\nВыбери ставку с каждого игрока:", _play_keyboard(buttons))
+            answer_callback(query_id, "Выбери ставку")
+            return True
+        if action == "stake":
+            setup_id, stake = int(parts[2]), int(parts[3])
+            setup = db.execute("SELECT * FROM play_setups WHERE setup_id=? AND chat_id=?", (setup_id, chat_id)).fetchone()
+            if not setup or int(setup["user_id"]) != user_id or int(setup["expires_at"]) <= int(time.time()):
+                answer_callback(query_id, "Настройка устарела. Запусти /play ещё раз.")
+                return True
+            cat = _current_cat(db, chat_id, user_id)
+            if not cat or stake < 1 or stake > min(MAX_STAKE, int(cat["stones"])):
+                answer_callback(query_id, "Ставка превышает твой баланс.")
+                return True
+            db.execute("UPDATE play_setups SET stake=? WHERE setup_id=?", (stake, setup_id))
+            db.commit()
+            setup = db.execute("SELECT * FROM play_setups WHERE setup_id=?", (setup_id,)).fetchone()
+            if setup["game_type"] == "ttt":
+                _edit_game_message(edit_message, chat_id, message_id, f"Ставка: {stake} камушков с каждого. Выбери размер поля:", _play_keyboard([
+                    [{"text": "3 × 3", "callback_data": f"pm:size:{setup_id}:3"}, {"text": "4 × 4", "callback_data": f"pm:size:{setup_id}:4"}],
+                    [{"text": "Отмена", "callback_data": f"pm:cancel:{setup_id}"}],
+                ]))
+                answer_callback(query_id, "Выбери поле")
+            else:
+                created = _publish_public_lobby(db, setup, send, edit_message)
+                answer_callback(query_id, "Игра создана" if created else "Не удалось открыть игру")
+            return True
+        if action == "size":
+            setup_id, size = int(parts[2]), int(parts[3])
+            setup = db.execute("SELECT * FROM play_setups WHERE setup_id=? AND chat_id=?", (setup_id, chat_id)).fetchone()
+            if not setup or int(setup["user_id"]) != user_id or size not in (3, 4):
+                answer_callback(query_id, "Настройка устарела или недоступна.")
+                return True
+            db.execute("UPDATE play_setups SET board_size=? WHERE setup_id=?", (size, setup_id))
+            db.commit()
+            setup = db.execute("SELECT * FROM play_setups WHERE setup_id=?", (setup_id,)).fetchone()
+            created = _publish_public_lobby(db, setup, send, edit_message)
+            answer_callback(query_id, "Игра создана" if created else "Не удалось открыть игру")
+            return True
+        if action == "cancel":
+            setup_id = int(parts[2])
+            db.execute("DELETE FROM play_setups WHERE setup_id=? AND user_id=?", (setup_id, user_id))
+            db.commit()
+            _edit_game_message(edit_message, chat_id, message_id, "Настройка игры отменена.", {"inline_keyboard": []})
+            answer_callback(query_id, "Отменено")
+            return True
+        if action == "join":
+            lobby_id = int(parts[2])
+            lobby = db.execute("SELECT * FROM public_game_lobbies WHERE lobby_id=? AND chat_id=?", (lobby_id, chat_id)).fetchone()
+            if not lobby or lobby["status"] != "open":
+                answer_callback(query_id, "В эту игру уже нельзя присоединиться.")
+                return True
+            _handle_join_lobby(db, lobby, user_id, send, edit_message, answer_callback, query_id)
+            return True
+        if action == "cancel_lobby":
+            lobby_id = int(parts[2])
+            lobby = db.execute(
+                "SELECT * FROM public_game_lobbies WHERE lobby_id=? AND chat_id=? AND status='open'",
+                (lobby_id, chat_id),
+            ).fetchone()
+            if not lobby:
+                answer_callback(query_id, "Этот вызов уже закрыт.")
+                return True
+            if int(lobby["owner_id"]) != user_id:
+                answer_callback(query_id, "Отменить вызов может только запустивший его участник.")
+                return True
+            db.execute("UPDATE public_game_lobbies SET status='cancelled' WHERE lobby_id=?", (lobby_id,))
+            db.commit()
+            _edit_game_message(edit_message, chat_id, message_id, "Вызов отменён. Камушки не списывались.", {"inline_keyboard": []})
+            _schedule_game_cleanup(db, chat_id, message_id)
+            answer_callback(query_id, "Вызов отменён")
+            return True
+        if action == "cell":
+            game_id, index = int(parts[2]), int(parts[3])
+            row = db.execute("SELECT * FROM ttt_games WHERE game_id=? AND chat_id=? AND state='active'", (game_id, chat_id)).fetchone()
+            if not row:
+                answer_callback(query_id, "Эта партия уже завершена.")
+                return True
+            if user_id not in (int(row["player_x"]), int(row["player_o"])):
+                answer_callback(query_id, "Ты не участник этой партии.")
+                return True
+            if int(row["turn_user"] or 0) != user_id:
+                answer_callback(query_id, "Сейчас ход соперника.")
+                return True
+            board = str(row["board"])
+            size = int(row["board_size"] or 3)
+            if index < 0 or index >= len(board) or board[index] != ".":
+                answer_callback(query_id, "Эта клетка уже занята.")
+                return True
+            mark = "X" if user_id == int(row["player_x"]) else "O"
+            board = board[:index] + mark + board[index + 1:]
+            winner_mark = _ttt_winner(board, size)
+            next_user = int(row["player_o"] if user_id == int(row["player_x"]) else row["player_x"])
+            if winner_mark or "." not in board:
+                winner_id = int(row["player_x"] if winner_mark == "X" else row["player_o"]) if winner_mark else None
+                if winner_id is None:
+                    for participant_id in (int(row["player_x"]), int(row["player_o"])):
+                        participant = _current_cat(db, chat_id, participant_id)
+                        if participant:
+                            game.change_stones(db, participant, int(row["stake"]), "возврат ставки: крестики-нолики", details="ничья")
+                    result = f"\n\n🤝 Ничья! По {row['stake']} камушков возвращены игрокам."
+                else:
+                    winner_cat = _current_cat(db, chat_id, winner_id)
+                    if winner_cat:
+                        game.change_stones(db, winner_cat, int(row["stake"]) * 2, "победа: крестики-нолики")
+                    result = f"\n\n🏆 Победил {_display_user(db, chat_id, winner_id)}! Получено {int(row['stake']) * 2} камушков."
+                db.execute("UPDATE ttt_games SET board=?,state='finished',turn_user=NULL,last_action_at=? WHERE game_id=?", (board, int(time.time()), game_id))
+                db.execute(
+                    "UPDATE public_game_lobbies SET status='finished' WHERE chat_id=? AND message_id=? AND status='active'",
+                    (chat_id, row["board_message_id"]),
+                )
+                db.commit()
+                final_row = db.execute("SELECT * FROM ttt_games WHERE game_id=?", (game_id,)).fetchone()
+                _edit_game_message(edit_message, chat_id, int(row["board_message_id"] or message_id), _ttt_status(db, final_row) + result, {"inline_keyboard": []})
+                _schedule_game_cleanup(db, chat_id, int(row["board_message_id"] or message_id))
+                for player_id in (int(row["player_x"]), int(row["player_o"])):
+                    participant = _current_cat(db, chat_id, player_id)
+                    if participant:
+                        record_weekly_event(db, participant, "games", winner=winner_id == player_id if winner_id else False)
+            else:
+                db.execute("UPDATE ttt_games SET board=?,turn_user=?,last_action_at=? WHERE game_id=?", (board, next_user, int(time.time()), game_id))
+                db.commit()
+                updated = db.execute("SELECT * FROM ttt_games WHERE game_id=?", (game_id,)).fetchone()
+                _edit_game_message(edit_message, chat_id, int(row["board_message_id"] or message_id), _ttt_status(db, updated), _ttt_markup(updated))
+                _schedule_game_cleanup(db, chat_id, int(row["board_message_id"] or message_id), PUBLIC_TTT_TURN_TTL + 120)
+            answer_callback(query_id, "Ход принят")
+            return True
+    except (IndexError, TypeError, ValueError):
+        answer_callback(query_id, "Кнопка игры устарела. Запусти /play ещё раз.")
+        return True
+    return True
+
+
+def handle_logic_answer(
+    db: sqlite3.Connection, message: dict[str, Any], send: GameSender,
+    edit_message: Callable[..., Any],
+) -> bool:
+    user = message.get("from", {})
+    chat_id = int(message.get("chat", {}).get("id", 0))
+    user_id = int(user.get("id", 0))
+    text = _normalize_answer(str(message.get("text", "")))
+    if not text or not user_id or not chat_id:
+        return False
+    row = db.execute(
+        "SELECT * FROM logic_games WHERE chat_id=? AND state='active' AND (player_a=? OR player_b=?) "
+        "ORDER BY logic_id DESC LIMIT 1",
+        (chat_id, user_id, user_id),
+    ).fetchone()
+    if not row:
+        return False
+    answers = json.loads(str(row["answers_json"]))
+    if text not in {_normalize_answer(str(answer)) for answer in answers}:
+        return False
+    score_a = int(row["score_a"]) + int(user_id == int(row["player_a"]))
+    score_b = int(row["score_b"]) + int(user_id == int(row["player_b"]))
+    round_index = int(row["round_index"])
+    question_set = json.loads(str(row["questions_json"]))
+    is_final = score_a >= 3 or score_b >= 3 or round_index >= len(question_set)
+    if is_final:
+        if score_a == score_b:
+            for player_id in (int(row["player_a"]), int(row["player_b"])):
+                participant = _current_cat(db, chat_id, player_id)
+                if participant:
+                    game.change_stones(db, participant, int(row["stake"]), "возврат ставки: логическая дуэль", details="ничья")
+            result = f"🤝 Логическая дуэль закончилась вничью {score_a}:{score_b}. Ставки возвращены. Ответ: {answers[0]}"
+            winner_id = None
+        else:
+            winner_id = int(row["player_a"] if score_a > score_b else row["player_b"])
+            winner_cat = _current_cat(db, chat_id, winner_id)
+            if winner_cat:
+                game.change_stones(db, winner_cat, int(row["stake"]) * 2, "победа: логическая дуэль", winner_id)
+            result = (
+                f"🏆 {_display_user(db, chat_id, winner_id)} выиграл логическую дуэль со счётом {score_a}:{score_b} "
+                f"и получает {int(row['stake']) * 2} камушков. Ответ: {answers[0]}"
+            )
+        db.execute("UPDATE logic_games SET score_a=?,score_b=?,state='finished' WHERE logic_id=?", (score_a, score_b, row["logic_id"]))
+        db.execute(
+            "UPDATE public_game_lobbies SET status='finished' WHERE chat_id=? AND message_id=? AND status='active'",
+            (chat_id, row["message_id"]),
+        )
+        db.commit()
+        edit_message(chat_id, int(row["message_id"] or 0), f"💡 Логическая дуэль завершена · {score_a}:{score_b}\n{result}", {"inline_keyboard": []})
+        _schedule_game_cleanup(db, chat_id, int(row["message_id"] or 0))
+        for player_id in (int(row["player_a"]), int(row["player_b"])):
+            participant = _current_cat(db, chat_id, player_id)
+            if participant:
+                record_weekly_event(db, participant, "games", winner=winner_id == player_id if winner_id else False)
+    else:
+        next_round = round_index + 1
+        next_question = question_set[round_index]
+        next_answers = next_question["answers"]
+        db.execute(
+            "UPDATE logic_games SET question=?,answers_json=?,round_index=?,score_a=?,score_b=? WHERE logic_id=?",
+            (
+                next_question["question"], json.dumps(next_answers, ensure_ascii=False),
+                next_round, score_a, score_b, row["logic_id"],
+            ),
+        )
+        db.commit()
+        edit_message(
+            chat_id, int(row["message_id"] or 0),
+            f"✅ Раунд {round_index}/5 завершён: {_display_user(db, chat_id, user_id)} получает очко.\n"
+            f"Счёт: {score_a}:{score_b}\n\n💡 Раунд {next_round}/5\n❔ {next_question['question']}\n\nПервый верный ответ получает очко.",
+            {"inline_keyboard": []},
+        )
+    return True
+
+
+def expire_public_games(db: sqlite3.Connection, edit_message: Callable[..., Any]) -> None:
+    """Refund stakes and close public games that have stalled."""
+    now = int(time.time())
+    logic_rows = db.execute(
+        "SELECT * FROM logic_games WHERE state='active' AND created_at<=?",
+        (now - PUBLIC_LOGIC_TTL,),
+    ).fetchall()
+    for row in logic_rows:
+        chat_id = int(row["chat_id"])
+        for player_id in (int(row["player_a"]), int(row["player_b"])):
+            cat = _current_cat(db, chat_id, player_id)
+            if cat:
+                game.change_stones(db, cat, int(row["stake"]), "возврат ставки: логическая дуэль", details="время вышло")
+        db.execute("UPDATE logic_games SET state='expired' WHERE logic_id=?", (row["logic_id"],))
+        db.execute(
+            "UPDATE public_game_lobbies SET status='expired' WHERE chat_id=? AND message_id=? AND status='active'",
+            (chat_id, row["message_id"]),
+        )
+        db.commit()
+        edit_message(
+            chat_id, int(row["message_id"] or 0),
+            "⌛ Логическая дуэль завершилась по времени. Ставки возвращены.",
+            {"inline_keyboard": []},
+        )
+        _schedule_game_cleanup(db, chat_id, int(row["message_id"] or 0))
+
+    ttt_rows = db.execute(
+        "SELECT * FROM ttt_games WHERE state='active' AND board_message_id IS NOT NULL"
+    ).fetchall()
+    for row in ttt_rows:
+        last_action = int(row["last_action_at"] or 0)
+        if not last_action:
+            try:
+                last_action = int(datetime.fromisoformat(str(row["created_at"])).timestamp())
+            except (TypeError, ValueError):
+                last_action = now
+        if last_action > now - PUBLIC_TTT_TURN_TTL:
+            continue
+        chat_id = int(row["chat_id"])
+        for player_id in (int(row["player_x"]), int(row["player_o"])):
+            cat = _current_cat(db, chat_id, player_id)
+            if cat:
+                game.change_stones(db, cat, int(row["stake"]), "возврат ставки: крестики-нолики", details="время вышло")
+        db.execute("UPDATE ttt_games SET state='expired',turn_user=NULL,last_action_at=? WHERE game_id=?", (now, row["game_id"]))
+        db.execute(
+            "UPDATE public_game_lobbies SET status='expired' WHERE chat_id=? AND message_id=? AND status='active'",
+            (chat_id, row["board_message_id"]),
+        )
+        db.commit()
+        final_row = db.execute("SELECT * FROM ttt_games WHERE game_id=?", (row["game_id"],)).fetchone()
+        edit_message(
+            chat_id, int(row["board_message_id"]),
+            _ttt_status(db, final_row) + "\n\n⌛ Партия завершилась по времени. Ставки возвращены.",
+            {"inline_keyboard": []},
+        )
+        _schedule_game_cleanup(db, chat_id, int(row["board_message_id"]))
+
+
 def handle_command(
     db: sqlite3.Connection,
     message: dict[str, Any],
     command: str,
     args: list[str],
     send: GameSender,
+    edit_message: Callable[..., Any] | None = None,
 ) -> bool:
-    if command in {"weekly", "leaderboard", "quiz", "answer"}:
+    if command in {"weekly", "leaderboard", "quiz", "answer", "play"}:
         chat_id = int(message["chat"]["id"])
         user_id = int(message.get("from", {}).get("id", 0))
         if command == "weekly":
             send(chat_id, weekly_status(db, chat_id, user_id))
         elif command == "leaderboard":
-            send(chat_id, weekly_leaderboard(db, chat_id))
+            send(chat_id, leaderboard(db, chat_id))
+        elif command == "play":
+            _play_menu(db, chat_id, user_id, send)
+        elif command in {"quiz", "answer"}:
+            send(chat_id, "Общая викторина пока приостановлена.")
         else:
             _quiz_command(db, chat_id, user_id, command, args, send)
     elif command in {
@@ -1959,7 +2694,7 @@ def handle_command(
     elif command == "race":
         _race_command(db, message, args, send)
     elif command in {"ttt", "accept", "decline", "cancelgame", "move", "resign"}:
-        _ttt_command(db, message, command, args, send)
+        _ttt_command(db, message, command, args, send, edit_message)
     else:
         return False
     return True

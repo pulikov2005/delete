@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import random
 import sqlite3
+import time
+import html
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
@@ -20,7 +22,7 @@ TASK_CHANCE = 0.35
 RENAME_COST = 10
 PERSONALITIES = ("Любознательный", "Игривый", "Ласковый", "Шустрый", "Упорный")
 PERSONALITY_HINTS = {
-    "Любознательный": "получает +1 XP, если первым выигрывает все три вопроса дня",
+    "Любознательный": "обожает задачки и загадки",
     "Игривый": "лучше восстанавливает настроение игрушечной мышкой",
     "Ласковый": "сильнее укрепляет доверие объятиями",
     "Шустрый": "получает небольшой бонус в котогонке",
@@ -102,6 +104,40 @@ def setup_db(db: sqlite3.Connection) -> None:
             day TEXT NOT NULL,
             PRIMARY KEY(chat_id,user_id,day)
         );
+        CREATE TABLE IF NOT EXISTS stone_ledger (
+            entry_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            cat_id INTEGER NOT NULL,
+            delta INTEGER NOT NULL,
+            balance_after INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            actor_id INTEGER,
+            details TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS stone_ledger_cat
+            ON stone_ledger(chat_id,user_id,entry_id DESC);
+        CREATE TABLE IF NOT EXISTS cat_name_prompts (
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            prompt_message_id INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            PRIMARY KEY(chat_id,user_id)
+        );
+        CREATE TABLE IF NOT EXISTS cat_gate_notices (
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            sent_at INTEGER NOT NULL,
+            PRIMARY KEY(chat_id,user_id)
+        );
+        CREATE TABLE IF NOT EXISTS daily_task_announcements (
+            chat_id INTEGER NOT NULL,
+            day TEXT NOT NULL,
+            slot INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'posting',
+            PRIMARY KEY(chat_id,day,slot)
+        );
         """
     )
     columns = {row["name"] for row in db.execute("PRAGMA table_info(cats)").fetchall()}
@@ -177,6 +213,34 @@ def _current_cat(db: sqlite3.Connection, chat_id: int, user_id: int) -> sqlite3.
         "SELECT * FROM cats WHERE chat_id=? AND user_id=? ORDER BY cat_id DESC LIMIT 1",
         (chat_id, user_id),
     ).fetchone()
+
+
+def change_stones(
+    db: sqlite3.Connection,
+    cat: sqlite3.Row,
+    delta: int,
+    source: str,
+    actor_id: int | None = None,
+    details: str = "",
+) -> bool:
+    """Change a cat's stone balance and record why it changed."""
+    delta = int(delta)
+    if delta == 0:
+        return True
+    current = db.execute("SELECT stones FROM cats WHERE cat_id=?", (cat["cat_id"],)).fetchone()
+    if not current or int(current["stones"]) + delta < 0:
+        return False
+    balance = int(current["stones"]) + delta
+    db.execute("UPDATE cats SET stones=? WHERE cat_id=?", (balance, cat["cat_id"]))
+    db.execute(
+        "INSERT INTO stone_ledger(chat_id,user_id,cat_id,delta,balance_after,source,actor_id,details,created_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?)",
+        (
+            int(cat["chat_id"]), int(cat["user_id"]), int(cat["cat_id"]), delta,
+            balance, str(source)[:100], actor_id, str(details)[:300], int(time.time()),
+        ),
+    )
+    return True
 
 
 def _new_cat(
@@ -286,7 +350,10 @@ def _xp_needed(level: int) -> int:
     return 10 + 2 * (level - 1)
 
 
-def _add_progress(db: sqlite3.Connection, cat: sqlite3.Row, xp: int, stones: int) -> tuple[int, int]:
+def _add_progress(
+    db: sqlite3.Connection, cat: sqlite3.Row, xp: int, stones: int,
+    stone_source: str = "игровая награда", actor_id: int | None = None,
+) -> tuple[int, int]:
     level = int(cat["level"])
     current_xp = int(cat["xp"]) + xp
     levels_gained = 0
@@ -295,16 +362,18 @@ def _add_progress(db: sqlite3.Connection, cat: sqlite3.Row, xp: int, stones: int
         level += 1
         levels_gained += 1
     db.execute(
-        "UPDATE cats SET xp=?,total_xp=total_xp+?,level=?,stones=stones+? WHERE cat_id=?",
-        (current_xp, xp, level, stones, cat["cat_id"]),
+        "UPDATE cats SET xp=?,total_xp=total_xp+?,level=? WHERE cat_id=?",
+        (current_xp, xp, level, cat["cat_id"]),
     )
+    if stones:
+        change_stones(db, cat, stones, stone_source, actor_id)
     db.commit()
     return level, levels_gained
 
 
 def _task_text(daily: sqlite3.Row) -> str:
     if not daily["task"]:
-        return "Сегодня специальное задание не выпало."
+        return "Сегодня специальное задание не выпало. /brush и /clean выполняются только когда соответствующее задание показано здесь."
     if daily["task_done"]:
         return f"Задание на сегодня выполнено: {TASKS[daily['task']]}."
     action = {
@@ -314,6 +383,37 @@ def _task_text(daily: sqlite3.Row) -> str:
         "feed": "/feed",
     }[daily["task"]]
     return f"Задание: {TASKS[daily['task']]}. Выполни командой {action}."
+
+
+def _task_prompt(
+    db: sqlite3.Connection, chat_id: int, user_id: int
+) -> tuple[str, dict[str, Any] | None, list[str]]:
+    cat, daily, notices = _prepare_cat(db, chat_id, user_id)
+    if not cat:
+        return "Сначала заведи котика командой /cat ИМЯ.", None, notices
+    text = (
+        f"🐾 Ежедневный уход за {cat['name']}\n{_task_text(daily)}\n"
+        f"Кормление на сегодня: {'выполнено' if daily['fed'] else 'нужно покормить'}.\n"
+        "Недельный прогресс смотри командой /weekly."
+    )
+    buttons: list[list[dict[str, str]]] = []
+    task_actions = {"brush": ("brush", "🪮 Выполнить: расчесать"),
+                    "litter": ("clean", "🧹 Выполнить: убрать лоток"),
+                    "vomit": ("clean", "🧹 Выполнить: убрать сюрприз"),
+                    "feed": ("feed", "🐟 Выполнить: покормить")}
+    if daily["task"] and not daily["task_done"]:
+        action, label = task_actions[str(daily["task"])]
+        buttons.append([{
+            "text": label,
+            "callback_data": f"care:{user_id}:{action}:{daily['day']}",
+        }])
+    if not daily["fed"] and int(cat["fish"]) > 0 and daily["task"] != "feed":
+        buttons.append([{
+            "text": "🐟 Покормить котика",
+            "callback_data": f"care:{user_id}:feed:{daily['day']}",
+        }])
+    markup = {"inline_keyboard": buttons} if buttons else None
+    return text, markup, notices
 
 
 def _send_notices(send: GameSender, chat_id: int, notices: list[str]) -> None:
@@ -357,7 +457,9 @@ def _complete_task(
     extra_xp, extra_stones = task_bonus_for_cat(db, cat)
     xp_earned = 3 + extra_xp
     stones_earned = 2 + extra_stones
-    _, levels_gained = _add_progress(db, cat, xp=xp_earned, stones=stones_earned)
+    _, levels_gained = _add_progress(
+        db, cat, xp=xp_earned, stones=stones_earned, stone_source="ежедневное задание", actor_id=int(cat["user_id"])
+    )
     from social_game import record_weekly_event
 
     weekly_completed = record_weekly_event(db, cat, "care")
@@ -421,7 +523,21 @@ def _handle_care(
     completed, levels_gained, xp_earned, stones_earned, weekly_completed = _complete_task(db, cat, daily, expected)
     db.commit()
     if not completed:
-        send(chat_id, "Сегодня такого задания нет или оно уже выполнено. Посмотреть задание: /task")
+        if not daily["task"]:
+            send(
+                chat_id,
+                "Сегодня специальное задание не выпало. /clean работает, только если в /task написано "
+                "«убрать лоток» или «убрать сюрприз». Недельный уход засчитывает выпавшие задания — проверь /weekly.",
+            )
+        elif daily["task_done"]:
+            send(chat_id, f"Сегодня уже выполнено: {TASKS[str(daily['task'])]}. Посмотри новое состояние через /task.")
+        else:
+            task_command = {"brush": "/brush", "litter": "/clean", "vomit": "/clean", "feed": "/feed"}[str(daily["task"])]
+            send(
+                chat_id,
+                f"Сегодня выпало задание: {TASKS[str(daily['task'])]}. Для него используй {task_command}. "
+                "Команды /brush и /clean не выполняют другие задания; смотри /task.",
+            )
         return
     message = f"🐾 Отличная забота! +{xp_earned} XP и +{stones_earned} камушка. Задание «{TASKS[daily['task']]}» выполнено."
     if levels_gained:
@@ -454,10 +570,8 @@ def _handle_train(
     if int(cat["stones"]) < cost:
         send(chat_id, f"Для тренировки нужно {cost} камушков, у котика сейчас {cat['stones']}.")
         return
-    db.execute(
-        f"UPDATE cats SET {stat}={stat}+1,stones=stones-? WHERE cat_id=?",
-        (cost, cat["cat_id"]),
-    )
+    db.execute(f"UPDATE cats SET {stat}={stat}+1 WHERE cat_id=?", (cat["cat_id"],))
+    change_stones(db, cat, -cost, "тренировка", user_id, stat)
     db.commit()
     display_name, emoji = STAT_NAMES[stat]
     new_value = current + 1
@@ -487,7 +601,7 @@ def _handle_stone_fishing(
 
     found_stone = random.random() < STONE_FISHING_SUCCESS_CHANCE
     if found_stone:
-        db.execute("UPDATE cats SET stones=stones+1 WHERE cat_id=?", (cat["cat_id"],))
+        change_stones(db, cat, 1, "рыбалка", user_id)
         db.commit()
         send(chat_id, f"🎣 {cat['name']} вытащил камушек! +1 камушек. Теперь у котика {int(cat['stones']) + 1}.")
     else:
@@ -502,7 +616,7 @@ def handle_command(
     args: list[str],
     send: GameSender,
 ) -> bool:
-    if command not in {"cat", "rename", "task", "feed", "brush", "clean", "train", "fishing"}:
+    if command not in {"cat", "rename", "task", "feed", "brush", "clean", "train", "fishing", "stat"}:
         return False
     chat_id = int(message["chat"]["id"])
     user_id = int(message.get("from", {}).get("id", 0))
@@ -517,11 +631,46 @@ def handle_command(
         _send_notices(send, chat_id, notices)
         if not cat:
             if requested_name is None and _current_cat(db, chat_id, user_id) is None:
-                send(chat_id, "Чтобы завести котика, укажи имя: /cat Снежок (до 24 символов).")
+                sent = send(
+                    chat_id,
+                    "🐾 Чтобы начать общаться в беседе, сначала заведи котика.\n"
+                    "Напиши имя в ответ на это сообщение или отправь команду /cat Снежок.\n"
+                    "Имя — до 24 символов.",
+                    reply_markup={"force_reply": True, "input_field_placeholder": "Имя котика"},
+                    auto_delete_after=300,
+                )
+                prompt_id = sent.get("message_id") if isinstance(sent, dict) else None
+                if prompt_id:
+                    db.execute(
+                        "INSERT INTO cat_name_prompts(chat_id,user_id,prompt_message_id,expires_at) VALUES(?,?,?,?) "
+                        "ON CONFLICT(chat_id,user_id) DO UPDATE SET prompt_message_id=excluded.prompt_message_id,expires_at=excluded.expires_at",
+                        (chat_id, user_id, int(prompt_id), int(time.time()) + 300),
+                    )
+                    db.commit()
             else:
                 send(chat_id, "Не получилось создать котика. Попробуй /cat Снежок.")
             return True
         send(chat_id, _status_text(cat, daily))
+    elif command == "stat":
+        cat = _current_cat(db, chat_id, user_id)
+        if not cat:
+            send(chat_id, "Сначала заведи котика командой /cat ИМЯ.")
+            return True
+        entries = db.execute(
+            "SELECT delta,source,details FROM stone_ledger WHERE chat_id=? AND user_id=? "
+            "ORDER BY entry_id DESC LIMIT 8",
+            (chat_id, user_id),
+        ).fetchall()
+        lines = [f"📊 {cat['name']}: 🪨 {cat['stones']} камушков"]
+        if entries:
+            lines.append("\nПоследние изменения:")
+            for entry in entries:
+                sign = "+" if int(entry["delta"]) > 0 else ""
+                detail = f" — {entry['details']}" if entry["details"] else ""
+                lines.append(f"• {sign}{entry['delta']} · {entry['source']}{detail}")
+        else:
+            lines.append("Пока изменений баланса не было.")
+        send(chat_id, "\n".join(lines))
     elif command == "rename":
         name = _cat_name(args)
         if name is None:
@@ -539,18 +688,17 @@ def handle_command(
             send(chat_id, f"Переименование стоит {RENAME_COST} камушков. Сейчас у котика {cat['stones']}.")
             return True
         db.execute(
-            "UPDATE cats SET name=?,stones=stones-? WHERE cat_id=?",
-            (name, RENAME_COST, cat["cat_id"]),
+            "UPDATE cats SET name=? WHERE cat_id=?",
+            (name, cat["cat_id"]),
         )
+        change_stones(db, cat, -RENAME_COST, "смена имени", user_id, name)
         db.commit()
         send(chat_id, f"✨ Теперь котика зовут {name}. Потрачено {RENAME_COST} камушков.")
     elif command == "task":
-        cat, daily, notices = _prepare_cat(db, chat_id, user_id)
+        prompt, keyboard, notices = _task_prompt(db, chat_id, user_id)
         _send_notices(send, chat_id, notices)
-        if cat:
-            send(chat_id, f"{_task_text(daily)}\nКормление на сегодня: {'выполнено' if daily['fed'] else 'нужно покормить'}.")
-        else:
-            send(chat_id, "Сначала заведи котика командой /cat.")
+        extra = {"reply_markup": keyboard} if keyboard else {}
+        send(chat_id, prompt, **extra)
     elif command == "feed":
         _handle_feed(db, chat_id, user_id, send)
     elif command == "fishing":
@@ -560,6 +708,181 @@ def handle_command(
     elif command == "train":
         _handle_train(db, chat_id, user_id, args, send)
     return True
+
+
+def handle_cat_name_reply(
+    db: sqlite3.Connection, message: dict[str, Any], send: GameSender
+) -> bool:
+    """Treat a reply to the /cat prompt as a cat-creation name."""
+    chat_id = int(message.get("chat", {}).get("id", 0))
+    user_id = int(message.get("from", {}).get("id", 0))
+    reply_id = int(message.get("reply_to_message", {}).get("message_id", 0))
+    if not chat_id or not user_id or not reply_id:
+        return False
+    prompt = db.execute(
+        "SELECT * FROM cat_name_prompts WHERE chat_id=? AND user_id=? AND prompt_message_id=?",
+        (chat_id, user_id, reply_id),
+    ).fetchone()
+    if not prompt:
+        return False
+    if int(prompt["expires_at"]) <= int(time.time()):
+        db.execute("DELETE FROM cat_name_prompts WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+        db.commit()
+        send(chat_id, "Подсказка устарела. Отправь /cat ИМЯ, например /cat Снежок.")
+        return True
+    name = _cat_name([str(message.get("text", ""))])
+    if not name:
+        send(chat_id, "Имя должно содержать от 1 до 24 символов. Ответь на подсказку ещё раз.")
+        return True
+    db.execute("DELETE FROM cat_name_prompts WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+    db.commit()
+    handle_command(db, message, "cat", [name], send)
+    return True
+
+
+def handle_task_callback(
+    db: sqlite3.Connection,
+    callback: dict[str, Any],
+    send: GameSender,
+    answer_callback: Callable[[str, str], Any],
+    edit_message: Callable[..., Any],
+) -> bool:
+    data = str(callback.get("data", ""))
+    if not data.startswith("care:"):
+        return False
+    query_id = str(callback.get("id", ""))
+    user = callback.get("from", {})
+    user_id = int(user.get("id", 0))
+    message = callback.get("message", {})
+    chat = message.get("chat", {})
+    chat_id = int(chat.get("id", 0))
+    message_id = int(message.get("message_id", 0))
+    try:
+        _, owner_text, action, day_text = data.split(":", 3)
+        owner_id = int(owner_text)
+    except (ValueError, TypeError):
+        answer_callback(query_id, "Кнопка устарела. Отправь /task ещё раз.")
+        return True
+    if user_id != owner_id:
+        answer_callback(query_id, "Эта кнопка предназначена владельцу котика.")
+        return True
+    if action not in {"brush", "clean", "feed"}:
+        answer_callback(query_id, "Неизвестное действие. Открой /task ещё раз.")
+        return True
+    cat, daily, notices = _prepare_cat(db, chat_id, user_id)
+    if not cat:
+        answer_callback(query_id, "Сначала заведи котика командой /cat ИМЯ.")
+        return True
+    _send_notices(send, chat_id, notices)
+    if str(daily["day"]) != day_text:
+        answer_callback(query_id, "Это задание уже устарело. Открой /task, чтобы увидеть сегодняшнее.")
+        return True
+    expected_action = {
+        "brush": "brush", "litter": "clean", "vomit": "clean", "feed": "feed",
+    }.get(str(daily["task"]))
+    task_button = expected_action == action and not bool(daily["task_done"])
+    daily_feed_button = action == "feed" and not bool(daily["fed"])
+    if not task_button and not daily_feed_button:
+        answer_callback(query_id, "Задание уже выполнено или изменилось. Открой /task ещё раз.")
+        return True
+
+    responses: list[str] = []
+
+    def capture(_chat_id: int, text: str, **_extra: Any) -> None:
+        responses.append(str(text))
+
+    if action == "feed":
+        _handle_feed(db, chat_id, user_id, capture)
+    else:
+        _handle_care(db, chat_id, user_id, action, capture)
+    prompt, keyboard, extra_notices = _task_prompt(db, chat_id, user_id)
+    _send_notices(send, chat_id, extra_notices)
+    if responses:
+        prompt += "\n\n" + responses[-1]
+    edit_message(
+        chat_id, message_id, prompt,
+        keyboard if keyboard else {"inline_keyboard": []},
+    )
+    answer_callback(query_id, "Готово")
+    return True
+
+
+def has_cat(db: sqlite3.Connection, chat_id: int, user_id: int) -> bool:
+    return _current_cat(db, chat_id, user_id) is not None
+
+
+def should_send_cat_gate_notice(db: sqlite3.Connection, chat_id: int, user_id: int) -> bool:
+    now = int(time.time())
+    row = db.execute(
+        "SELECT sent_at FROM cat_gate_notices WHERE chat_id=? AND user_id=?",
+        (chat_id, user_id),
+    ).fetchone()
+    if row and int(row["sent_at"]) > now - 300:
+        return False
+    db.execute(
+        "INSERT INTO cat_gate_notices(chat_id,user_id,sent_at) VALUES(?,?,?) "
+        "ON CONFLICT(chat_id,user_id) DO UPDATE SET sent_at=excluded.sent_at",
+        (chat_id, user_id, now),
+    )
+    db.commit()
+    return True
+
+
+def announce_due_daily_tasks(db: sqlite3.Connection, send: GameSender) -> None:
+    """At 10:00 and 20:00 Yekaterinburg time, mention members with a daily task."""
+    now = datetime.now(ZoneInfo("Asia/Yekaterinburg"))
+    if not ((now.hour == 10 or now.hour == 20) and now.minute < 15):
+        return
+    slot = 10 if now.hour == 10 else 20
+    day = now.date()
+    groups = db.execute("SELECT DISTINCT chat_id FROM cats WHERE chat_id<0").fetchall()
+    for group in groups:
+        chat_id = int(group["chat_id"])
+        cursor = db.execute(
+            "INSERT OR IGNORE INTO daily_task_announcements(chat_id,day,slot,status) VALUES(?,?,?,'posting')",
+            (chat_id, day.isoformat(), slot),
+        )
+        if cursor.rowcount == 0:
+            continue
+        current_cats = db.execute(
+            "SELECT c.* FROM cats c WHERE c.chat_id=? AND c.cat_id=("
+            "SELECT MAX(c2.cat_id) FROM cats c2 WHERE c2.chat_id=c.chat_id AND c2.user_id=c.user_id)",
+            (chat_id,),
+        ).fetchall()
+        lines: list[str] = []
+        for cat in current_cats:
+            daily = _daily(db, int(cat["cat_id"]), day)
+            if not daily["task"] or daily["task_done"]:
+                continue
+            user = db.execute(
+                "SELECT username,first_name FROM known_users WHERE chat_id=? AND user_id=?",
+                (chat_id, cat["user_id"]),
+            ).fetchone()
+            if user and user["username"]:
+                who = "@" + str(user["username"])
+            else:
+                display = html.escape(str(user["first_name"] if user else cat["name"]))
+                who = f'<a href="tg://user?id={int(cat["user_id"])}">{display}</a>'
+            lines.append(f"• {who} — {TASKS[str(daily['task'])]} ({html.escape(str(cat['name']))})")
+        try:
+            if lines:
+                send(
+                    chat_id,
+                    f"🐾 Ежедневные задания на сегодня — {slot:02d}:00, Екатеринбург:\n" + "\n".join(lines),
+                    parse_mode="HTML",
+                )
+        except Exception:
+            db.execute(
+                "DELETE FROM daily_task_announcements WHERE chat_id=? AND day=? AND slot=?",
+                (chat_id, day.isoformat(), slot),
+            )
+            db.commit()
+            raise
+        db.execute(
+            "UPDATE daily_task_announcements SET status='sent' WHERE chat_id=? AND day=? AND slot=?",
+            (chat_id, day.isoformat(), slot),
+        )
+        db.commit()
 
 
 def is_activity_message(message: dict[str, Any]) -> bool:
@@ -646,5 +969,5 @@ def award_minigame_win(db: sqlite3.Connection, chat_id: int, user_id: int) -> bo
         )
     except sqlite3.IntegrityError:
         return False
-    _add_progress(db, cat, xp=1, stones=1)
+    _add_progress(db, cat, xp=1, stones=1, stone_source="победа в мини-игре", actor_id=user_id)
     return True

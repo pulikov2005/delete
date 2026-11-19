@@ -240,6 +240,16 @@ def send_message(chat_id: int, text: str, **extra: Any) -> Any:
     return result
 
 
+def edit_game_message(
+    chat_id: int, message_id: int, text: str,
+    reply_markup: dict[str, Any] | None = None,
+) -> Any:
+    payload: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    return api("editMessageText", payload)
+
+
 def schedule_auto_delete(
     db: sqlite3.Connection, chat_id: int, message_id: int, delete_after: int
 ) -> None:
@@ -950,6 +960,41 @@ def handle_stats(
     return "\n".join(lines)
 
 
+def handle_stone_log(
+    db: sqlite3.Connection, chat_id: int, message: dict[str, Any], args: list[str]
+) -> str:
+    target = resolve_target(db, chat_id, message, args) if args or message.get("reply_to_message") else None
+    if (args or message.get("reply_to_message")) and not target:
+        return "Не нашёл участника. Ответь на его сообщение или укажи @username, которого бот уже видел."
+    query = (
+        "SELECT l.delta,l.source,l.details,l.created_at,l.user_id,l.actor_id,l.balance_after,c.name,u.first_name,u.username,"
+        "a.first_name AS actor_first_name,a.username AS actor_username "
+        "FROM stone_ledger l LEFT JOIN cats c ON c.cat_id=l.cat_id "
+        "LEFT JOIN known_users u ON u.chat_id=l.chat_id AND u.user_id=l.user_id "
+        "LEFT JOIN known_users a ON a.chat_id=l.chat_id AND a.user_id=l.actor_id WHERE l.chat_id=?"
+    )
+    params: list[Any] = [chat_id]
+    if target:
+        query += " AND l.user_id=?"
+        params.append(int(target["id"]))
+    query += " ORDER BY l.entry_id DESC LIMIT 30"
+    rows = db.execute(query, params).fetchall()
+    title = "Журнал камушков" if not target else f"Журнал камушков · {html.escape(str(target.get('first_name') or 'участник'))}"
+    lines = [f"🪨 <b>{title}</b>"]
+    for row in rows:
+        name = row["username"] and f"@{html.escape(str(row['username']))}" or html.escape(str(row["first_name"] or row["name"] or "котик"))
+        stamp = datetime.fromtimestamp(int(row["created_at"]), ZoneInfo("Asia/Yekaterinburg")).strftime("%d.%m %H:%M")
+        sign = "+" if int(row["delta"]) > 0 else ""
+        details = f" — {html.escape(str(row['details']))}" if row["details"] else ""
+        if row["actor_id"] and row["actor_id"] != row["user_id"]:
+            actor_name = "@" + html.escape(str(row["actor_username"])) if row["actor_username"] else html.escape(str(row["actor_first_name"] or "администратор"))
+            details += f" (кто: {actor_name})"
+        lines.append(f"{stamp} · {name} · {sign}{row['delta']} → {row['balance_after']} · {html.escape(str(row['source']))}{details}")
+    if not rows:
+        lines.append("Записей пока нет.")
+    return "\n".join(lines)
+
+
 def send_warnings(db: sqlite3.Connection, chat_id: int, target: dict[str, Any]) -> str:
     user_id = int(target["id"])
     expire_warnings(db, chat_id, user_id)
@@ -986,7 +1031,7 @@ def handle_group_command(
 
     if game.handle_command(db, message, command, args, send_message):
         return
-    if social_game.handle_command(db, message, command, args, send_message):
+    if social_game.handle_command(db, message, command, args, send_message, edit_game_message):
         return
 
     if command in ("help", "start"):
@@ -999,15 +1044,16 @@ def handle_group_command(
             "<code>/mute @username 1M</code> — мут на месяц; можно также ответить командой на сообщение участника.\n"
             "<code>/ban @username 2H</code> — временный бан; срок задаётся так же через H, D или M.\n"
             "<code>/inactive</code> или <code>/inactive 7</code> — показать активных за период и кандидатов, не писавших 7 дней; удаление — после подтверждения (только админ).\n"
-            "Команды и сообщения бота удаляются примерно через 40 секунд; вопросы викторины и подтверждение /inactive остаются на время действия.\n"
+            "Команды и обычные сообщения бота удаляются примерно через 40 секунд; игровое поле и подтверждение /inactive остаются до конца действия.\n"
             "<code>/unmute</code> — снять мут с участника.\n"
             "<code>/practice 5</code> — отправить участника решать 5 лёгких примеров; "
             "при ответе на сообщение команда выбирает участника из этого сообщения.\n\n"
             "<code>/warn причина</code> — выдать WARN ответом на сообщение или через @username. WARN действует 7 дней; третий активный WARN за этот срок приводит к бану на 7 дней.\n"
             "<code>/warns</code> — посмотреть свои предупреждения; модератор или админ может указать другого участника. <code>/unwarn</code> — снять последнее, <code>/warnclear</code> — снять все (только админ).\n"
             "<code>/stats</code> — статистика беседы; ответь командой на сообщение или укажи @username для личной статистики.\n\n"
-            "🐱 <code>/cat Имя</code> — завести котика с именем или посмотреть своего.\n"
-            "<code>/rename Имя</code> — переименовать котика; цена — 10 камушков. <code>/task</code> — ежедневное задание.\n"
+            "🐱 <code>/cat ИМЯ</code> — создать котика; если отправить просто <code>/cat</code>, бот попросит ввести имя. Без котика обычные сообщения не попадут в чат.\n"
+            "<code>/stat</code> — посмотреть свои камушки и последние причины изменения баланса. <code>/stats</code> — общая статистика беседы.\n"
+            "<code>/rename Имя</code> — переименовать котика; цена — 10 камушков. <code>/task</code> — ежедневное задание и кнопка правильного действия. Нажимай только её; /brush и /clean срабатывают лишь для выпавшего задания.\n"
             "<code>/feed</code> — потратить рыбку и повысить настроение на 1; активный мини-котёнок средней редкости даёт ещё +1.\n"
             "<code>/fishing</code> — раз в день попробовать поймать камушек: шанс находки 70%, шанс пустой рыбалки — 30%.\n"
             "<code>/brush</code>, <code>/clean</code> — уход; <code>/train сила</code> — тренировка за камушки.\n"
@@ -1023,17 +1069,19 @@ def handle_group_command(
             "<b>Предметы</b>\n"
             "<code>/shop</code>, <code>/buy предмет</code>, <code>/items</code>, <code>/use предмет</code>.\n"
             "Есть автокормушка, игрушечная мышка и палочка нежности.\n\n"
-            "<b>Мини-игра</b>\n"
-            "Ответь командой <code>/ttt</code> или <code>/race</code> на сообщение соперника, чтобы выбрать ставку кнопкой или отправить её числом. Можно также сразу указать <code>@username</code> и сумму.\n"
+            "<b>Игры</b>\n"
+            "<code>/play</code> — открыть меню игр, выбрать ставку и настройки. Вызов увидят все участники; первый, кто нажмёт «Присоединиться», станет соперником.\n"
+            "В меню есть крестики-нолики с полем 3×3 или 4×4, котогонка и логическая дуэль на 5 вопросов: первый, кто наберёт 3 очка, выигрывает банк.\n"
+            "Старые команды <code>/ttt</code> и <code>/race</code> тоже пока доступны для вызова конкретного участника.\n"
             "<code>/accept</code> или <code>/decline</code>, отменить своё приглашение — <code>/cancelgame</code>.\n"
-            "Ходы — <code>/move 1</code>…<code>/move 9</code>; выйти — <code>/resign</code>.\n\n"
-            "<b>Недельные задания и викторина</b>\n"
-            "<code>/weekly</code> — личное задание недели; три общих вопроса викторины выходят в 10:00, 15:00 и 20:00. Отвечай кнопкой или командами <code>/answer 1</code>, <code>/answer 2</code>, <code>/answer 3</code>. <code>/quiz</code> покажет расписание и твой прогресс.\n"
-            "<code>/leaderboard</code> — рейтинг котиков за неделю. Характер виден в профиле и влияет на небольшой бонус.\n\n"
+            "Ход делается нажатием на клетку в сообщении с полем; выйти можно командой <code>/resign</code>.\n\n"
+            "<b>Недельное задание</b>\n"
+            "<code>/weekly</code> — личное задание недели. Если там уход 0/3, выполняй три задания, которые появятся в <code>/task</code>; нажатие /clean само по себе не засчитывается. Напоминания выходят в 10:00 и 20:00 по Екатеринбургу. Общая викторина отключена.\n"
+            "<code>/leaderboard</code> — рейтинг котиков за всё время: очки, сообщения, уход и игры. Характер виден в профиле и влияет на небольшой бонус.\n\n"
             "<code>/modadd</code> и <code>/modremove</code> — выдать или снять роль модератора; "
             "модератор может мутить, снимать мут и выдавать WARN.\n"
             "Администратору доступны все команды модерации. Модераторам — mute, unmute, warn и unwarn; любой участник может посмотреть собственные WARN. "
-            "Примеры приходят в личку с ботом.",
+            "<code>/give @username 10</code> и <code>/take @username 10</code> — выдать или изъять камушки; <code>/stonelog</code> — журнал изменений (только администратор). Команды можно отправить ответом на сообщение. Примеры Cat practice приходят в личку с ботом.",
             parse_mode="HTML",
         )
         return
@@ -1044,7 +1092,7 @@ def handle_group_command(
 
     supported = {
         "mute", "ban", "unmute", "practice", "training", "modadd", "modremove", "mods",
-        "warn", "warns", "unwarn", "warnclear", "inactive",
+        "warn", "warns", "unwarn", "warnclear", "inactive", "give", "take", "stonelog",
     }
     if command not in supported:
         return
@@ -1071,6 +1119,36 @@ def handle_group_command(
         allowed = admin
     if not allowed:
         send_message(chat_id, "😼 Для этой команды нужны права администратора или назначенная роль модератора.")
+        return
+
+    if command in {"give", "take"}:
+        target = target_or_help(db, chat_id, message, args)
+        if not target:
+            return
+        amount = next((int(arg) for arg in args if arg.isdigit()), None)
+        if amount is None or amount < 1 or amount > 100000:
+            send_message(chat_id, "Формат: ответь на сообщение или укажи @username и сумму, например /give @user 10.")
+            return
+        cat = game._current_cat(db, chat_id, int(target["id"]))
+        if not cat:
+            send_message(chat_id, "У этого участника ещё нет котика в беседе.")
+            return
+        delta = amount if command == "give" else -amount
+        if not game.change_stones(
+            db, cat, delta,
+            "выдача администратором" if delta > 0 else "изъятие администратором",
+            actor_id=int(actor_id), details=str(target.get("first_name") or ""),
+        ):
+            send_message(chat_id, f"Нельзя изъять {amount}: у котика только {int(cat['stones'])} камушков.")
+            return
+        db.commit()
+        verb = "выдал" if delta > 0 else "изъял"
+        balance = int(cat["stones"]) + delta
+        send_message(chat_id, f"🪨 Администратор {verb} {amount} камушков у {mention(target)}. Баланс: {balance}.", parse_mode="HTML")
+        return
+
+    if command == "stonelog":
+        send_message(chat_id, handle_stone_log(db, chat_id, message, args), parse_mode="HTML")
         return
 
     if command == "mods":
@@ -1353,12 +1431,16 @@ def handle_update(db: sqlite3.Connection, update: dict[str, Any], bot_username: 
             "answerCallbackQuery",
             {"callback_query_id": query_id, "text": text, "show_alert": False},
         )
-        handled = social_game.handle_quiz_callback(
-            db,
-            callback,
-            send_message,
-            answer_callback,
+        handled = game.handle_task_callback(
+            db, callback, send_message, answer_callback, edit_game_message,
         )
+        if not handled:
+            handled = social_game.handle_play_callback(
+                db, callback, send_message, answer_callback, edit_game_message,
+            )
+        if not handled and str(callback.get("data", "")).startswith("quiz:"):
+            answer_callback(str(callback.get("id", "")), "Общая викторина пока приостановлена.")
+            handled = True
         if not handled:
             handled = social_game.handle_game_stake_callback(db, callback, send_message, answer_callback)
         if not handled:
@@ -1385,6 +1467,13 @@ def handle_update(db: sqlite3.Connection, update: dict[str, Any], bot_username: 
     if chat.get("type") not in ("group", "supergroup"):
         return
     parsed = parse_command(text)
+    if not parsed and game.handle_cat_name_reply(db, message, send_message):
+        if user:
+            remember_user(db, int(chat["id"]), user, None)
+        schedule_auto_delete(
+            db, int(chat["id"]), int(message.get("message_id", 0)), AUTO_DELETE_DELAY_SECONDS,
+        )
+        return
     if not parsed and social_game.handle_pending_game_stake(db, message, send_message):
         if user:
             remember_user(db, int(chat["id"]), user, None)
@@ -1403,6 +1492,22 @@ def handle_update(db: sqlite3.Connection, update: dict[str, Any], bot_username: 
             except (TypeError, ValueError):
                 activity_at = int(time.time())
         remember_user(db, int(chat["id"]), user, activity_at)
+    if not parsed and user and game.is_activity_message(message) and not game.has_cat(
+        db, int(chat["id"]), int(user.get("id", 0))
+    ):
+        if game.should_send_cat_gate_notice(db, int(chat["id"]), int(user["id"])):
+            send_message(
+                int(chat["id"]),
+                f"Привет, {html.escape(user.get('first_name', 'котик'))}! Чтобы начать общение в беседе, "
+                "создай своего кота командой /cat ИМЯ.",
+                parse_mode="HTML",
+                auto_delete_after=300,
+            )
+        try:
+            api("deleteMessage", {"chat_id": int(chat["id"]), "message_id": int(message.get("message_id", 0))})
+        except TelegramError as exc:
+            logging.warning("Could not delete message from member without a cat: %s", exc)
+        return
     if parsed:
         command_head = (text or "").strip().split(maxsplit=1)[0][1:]
         target_bot = command_head.split("@", 1)[1].casefold() if "@" in command_head else ""
@@ -1418,6 +1523,7 @@ def handle_update(db: sqlite3.Connection, update: dict[str, Any], bot_username: 
                 )
     else:
         game.record_group_message(db, message, send_message)
+        social_game.handle_logic_answer(db, message, send_message, edit_game_message)
 
 
 def main() -> None:
@@ -1446,7 +1552,8 @@ def main() -> None:
                 {"command": "unwarn", "description": "Снять последнее или указанное предупреждение"},
                 {"command": "warnclear", "description": "Снять все предупреждения (админ)"},
                 {"command": "stats", "description": "Статистика котиков и сообщений"},
-                {"command": "cat", "description": "Завести котика с именем или посмотреть статус"},
+                {"command": "stat", "description": "Свои камушки и история баланса"},
+                {"command": "cat", "description": "Создать котика: /cat ИМЯ"},
                 {"command": "rename", "description": "Переименовать котика (10 камушков)"},
                 {"command": "kiss", "description": "Выразить симпатию взаимно"},
                 {"command": "hug", "description": "Укрепить доверие в паре"},
@@ -1470,13 +1577,12 @@ def main() -> None:
                 {"command": "accept", "description": "Принять вызов в игру"},
                 {"command": "decline", "description": "Отклонить вызов в игру"},
                 {"command": "cancelgame", "description": "Отменить своё приглашение"},
+                {"command": "play", "description": "Открыть меню игр"},
                 {"command": "move", "description": "Сделать ход в крестики-нолики"},
                 {"command": "resign", "description": "Завершить партию досрочно"},
                 {"command": "weekly", "description": "Показать недельное задание котика"},
-                {"command": "quiz", "description": "Расписание и прогресс общей викторины"},
-                {"command": "answer", "description": "Ответить на вопрос викторины"},
-                {"command": "leaderboard", "description": "Таблица лидеров за неделю"},
-                {"command": "task", "description": "Показать ежедневное задание котика"},
+                {"command": "leaderboard", "description": "Таблица лидеров за всё время"},
+                {"command": "task", "description": "Задание котика и кнопка действия"},
                 {"command": "feed", "description": "Покормить котика рыбкой"},
                 {"command": "fishing", "description": "Попробовать поймать камушек раз в день"},
                 {"command": "brush", "description": "Расчесать котика"},
@@ -1485,6 +1591,9 @@ def main() -> None:
                 {"command": "modadd", "description": "Назначить модератора (ответом на сообщение)"},
                 {"command": "modremove", "description": "Снять роль модератора"},
                 {"command": "mods", "description": "Показать список модераторов"},
+                {"command": "give", "description": "Выдать камушки участнику (админ)"},
+                {"command": "take", "description": "Изъять камушки участника (админ)"},
+                {"command": "stonelog", "description": "Журнал камушков (админ)"},
             ]
         },
     )
@@ -1494,9 +1603,13 @@ def main() -> None:
         try:
             process_due_auto_deletes(db)
             try:
-                social_game.publish_due_quiz_questions(db, send_message)
+                game.announce_due_daily_tasks(db, send_message)
             except Exception:
-                logging.exception("Could not publish scheduled quiz questions")
+                logging.exception("Could not publish scheduled daily task reminders")
+            try:
+                social_game.expire_public_games(db, edit_game_message)
+            except Exception:
+                logging.exception("Could not expire stalled public games")
             updates = api(
                 "getUpdates",
                 {"offset": offset, "timeout": 5, "allowed_updates": ["message", "callback_query"]},
