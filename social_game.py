@@ -388,14 +388,9 @@ def weekly_status(db: sqlite3.Connection, chat_id: int, user_id: int) -> str:
     progress = min(int(quest["progress"]), int(quest["target"]))
     state = "✅ выполнено" if quest["completed"] else f"{progress}/{quest['target']}"
     stones = 10 + (2 if cat["personality"] == "Упорный" else 0)
-    guidance = (
-        "Засчитываются только задания, которые выпали и показаны в /task; там же нажми кнопку нужного действия."
-        if str(quest["kind"]) == "care" else "Выполненные задания также добавляют очки в /leaderboard."
-    )
     return (
-        f"📅 Недельное задание для {cat['name']}\n{title}: {state}\n"
-        f"Награда: +8 XP и +{stones} камушков. Сброс — в понедельник.\n"
-        f"{guidance}"
+        f"📅 Недельное задание: {title} — {state}.\n"
+        f"Награда: +8 XP и +{stones} камушков. Сброс — в понедельник."
     )
 
 
