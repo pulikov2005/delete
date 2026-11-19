@@ -1146,7 +1146,6 @@ def _marriage_command(
         ):
             send(chat_id, f"Для свадьбы каждому нужно {MARRIAGE_COST} камушков. Пока предложение остаётся открытым.")
             return
-        db.execute(
         game.change_stones(db, proposer_cat, -MARRIAGE_COST, "свадьба", proposer)
         game.change_stones(db, acceptor_cat, -MARRIAGE_COST, "свадьба", user_id)
         db.execute(
