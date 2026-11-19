@@ -421,10 +421,20 @@ def _send_notices(send: GameSender, chat_id: int, notices: list[str]) -> None:
         send(chat_id, notice)
 
 
-def _status_text(cat: sqlite3.Row, daily: sqlite3.Row) -> str:
+def _cat_profile_text(
+    db: sqlite3.Connection, chat_id: int, user_id: int,
+    cat: sqlite3.Row, daily: sqlite3.Row,
+) -> str:
     max_mood = _max_mood(cat)
     mood_note = " 😿 Котику нужно немного заботы." if int(cat["mood"]) == 0 else ""
     next_xp = "MAX" if int(cat["level"]) >= MAX_LEVEL else str(_xp_needed(int(cat["level"])) - int(cat["xp"]))
+    message_count = int(db.execute(
+        "SELECT COALESCE(SUM(message_count),0) FROM cat_days WHERE cat_id=?",
+        (cat["cat_id"],),
+    ).fetchone()[0])
+    from social_game import weekly_status
+
+    week = weekly_status(db, chat_id, user_id).replace("\n", " · ")
     return (
         f"🐱 {cat['name']} — твой {cat['color']} котик №{cat['serial']}\n"
         f"Характер: {cat['personality']} — {PERSONALITY_HINTS.get(cat['personality'], 'особый нрав')}\n"
@@ -433,9 +443,19 @@ def _status_text(cat: sqlite3.Row, daily: sqlite3.Row) -> str:
         f"Настроение: {cat['mood']}/{max_mood} | 🐟 Рыбки: {cat['fish']} | 🪨 Камушки: {cat['stones']}\n"
         f"💪 Сила {cat['strength']} · 💨 Ловкость {cat['agility']} · "
         f"❤️ Выносливость {cat['endurance']} · 🍀 Удача {cat['luck']}\n"
-        f"{_task_text(daily)}{mood_note}\n\n"
-        "Команды: /task, /feed, /brush, /clean, /train, /rename"
+        f"💬 Сообщений: {message_count}\n"
+        f"📌 {_task_text(daily)}{mood_note}\n"
+        f"{week}\n\n"
+        "Нажми кнопку, чтобы открыть историю камушков или задания."
     )
+
+
+def _cat_profile_markup(user_id: int) -> dict[str, Any]:
+    return {"inline_keyboard": [
+        [{"text": "🪨 История камушков", "callback_data": f"cat:stones:{user_id}"}],
+        [{"text": "📅 Задания", "callback_data": f"cat:tasks:{user_id}"}],
+        [{"text": "🛒 Магазин", "callback_data": f"shop:open:{user_id}"}],
+    ]}
 
 
 def _complete_task(
@@ -616,7 +636,7 @@ def handle_command(
     args: list[str],
     send: GameSender,
 ) -> bool:
-    if command not in {"cat", "rename", "task", "feed", "brush", "clean", "train", "fishing", "stat"}:
+    if command not in {"cat", "rename", "task", "feed", "brush", "clean", "train", "fishing"}:
         return False
     chat_id = int(message["chat"]["id"])
     user_id = int(message.get("from", {}).get("id", 0))
@@ -650,27 +670,10 @@ def handle_command(
             else:
                 send(chat_id, "Не получилось создать котика. Попробуй /cat Снежок.")
             return True
-        send(chat_id, _status_text(cat, daily))
-    elif command == "stat":
-        cat = _current_cat(db, chat_id, user_id)
-        if not cat:
-            send(chat_id, "Сначала заведи котика командой /cat ИМЯ.")
-            return True
-        entries = db.execute(
-            "SELECT delta,source,details FROM stone_ledger WHERE chat_id=? AND user_id=? "
-            "ORDER BY entry_id DESC LIMIT 8",
-            (chat_id, user_id),
-        ).fetchall()
-        lines = [f"📊 {cat['name']}: 🪨 {cat['stones']} камушков"]
-        if entries:
-            lines.append("\nПоследние изменения:")
-            for entry in entries:
-                sign = "+" if int(entry["delta"]) > 0 else ""
-                detail = f" — {entry['details']}" if entry["details"] else ""
-                lines.append(f"• {sign}{entry['delta']} · {entry['source']}{detail}")
-        else:
-            lines.append("Пока изменений баланса не было.")
-        send(chat_id, "\n".join(lines))
+        send(
+            chat_id, _cat_profile_text(db, chat_id, user_id, cat, daily),
+            reply_markup=_cat_profile_markup(user_id),
+        )
     elif command == "rename":
         name = _cat_name(args)
         if name is None:
@@ -737,6 +740,77 @@ def handle_cat_name_reply(
     db.execute("DELETE FROM cat_name_prompts WHERE chat_id=? AND user_id=?", (chat_id, user_id))
     db.commit()
     handle_command(db, message, "cat", [name], send)
+    return True
+
+
+def handle_cat_callback(
+    db: sqlite3.Connection,
+    callback: dict[str, Any],
+    send: GameSender,
+    answer_callback: Callable[[str, str], Any],
+    edit_message: Callable[..., Any],
+) -> bool:
+    data = str(callback.get("data", ""))
+    if not data.startswith("cat:"):
+        return False
+    query_id = str(callback.get("id", ""))
+    user_id = int(callback.get("from", {}).get("id", 0))
+    message = callback.get("message", {})
+    chat_id = int(message.get("chat", {}).get("id", 0))
+    message_id = int(message.get("message_id", 0))
+    try:
+        _, section, owner_text = data.split(":", 2)
+        owner_id = int(owner_text)
+    except (ValueError, TypeError):
+        answer_callback(query_id, "Кнопка устарела. Открой /cat ещё раз.")
+        return True
+    if user_id != owner_id:
+        answer_callback(query_id, "Эта карточка принадлежит другому участнику.")
+        return True
+
+    cat, daily, notices = _prepare_cat(db, chat_id, user_id)
+    if not cat or not daily:
+        answer_callback(query_id, "Котик не найден. Создай его командой /cat ИМЯ.")
+        return True
+    _send_notices(send, chat_id, notices)
+
+    if section == "stones":
+        entries = db.execute(
+            "SELECT delta,source,details FROM stone_ledger WHERE chat_id=? AND user_id=? "
+            "ORDER BY entry_id DESC LIMIT 8",
+            (chat_id, user_id),
+        ).fetchall()
+        lines = [f"🪨 Баланс {cat['name']}: {cat['stones']} камушков", "Последние изменения:"]
+        if entries:
+            for entry in entries:
+                sign = "+" if int(entry["delta"]) > 0 else ""
+                detail = f" — {entry['details']}" if entry["details"] else ""
+                lines.append(f"• {sign}{entry['delta']} · {entry['source']}{detail}")
+        else:
+            lines.append("Пока изменений баланса не было.")
+    elif section == "tasks":
+        from social_game import weekly_status
+
+        lines = [
+            f"📅 Задания для {cat['name']}",
+            f"Сегодня: {_task_text(daily)}",
+            weekly_status(db, chat_id, user_id),
+            "Для выполнения ежедневного задания открой /task и нажми кнопку действия.",
+        ]
+    elif section == "profile":
+        text = _cat_profile_text(db, chat_id, user_id, cat, daily)
+        edit_message(chat_id, message_id, text, _cat_profile_markup(user_id))
+        answer_callback(query_id, "Карточка котика")
+        return True
+    else:
+        answer_callback(query_id, "Раздел не найден. Открой /cat ещё раз.")
+        return True
+
+    edit_message(
+        chat_id, message_id, "\n".join(lines),
+        {"inline_keyboard": [[{"text": "🐱 Назад к котику", "callback_data": f"cat:profile:{user_id}"}]]},
+    )
+    answer_callback(query_id, "Готово")
     return True
 
 

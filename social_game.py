@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import html
 import logging
 import random
 import sqlite3
@@ -45,6 +46,11 @@ ITEMS = {
     "feeder": ("Автокормушка", 25, "постоянный предмет"),
     "toy": ("Игрушечная мышка", 8, "расходуется при использовании"),
     "wand": ("Палочка нежности", 15, "расходуется при использовании"),
+}
+ITEM_INFO = {
+    "feeder": "Постоянная. Загрузи командой /use feeder: вмещает до 3 рыбок и автоматически кормит котика одной рыбкой, если ты забыл покормить его за день.",
+    "toy": "Одноразовая. Команда /use toy поднимает настроение на 2 пункта, а игривому котику — на 3.",
+    "wand": "Одноразовая. Команда /use wand повышает доверие к партнёру на 15 пунктов (не выше 100). Работает, только если вы в отношениях.",
 }
 ITEM_ALIASES = {
     "feeder": "feeder", "autofeeder": "feeder", "кормушка": "feeder", "автокормушка": "feeder",
@@ -327,21 +333,23 @@ QUIZ_QUESTIONS = (
 )
 
 LOGIC_QUESTIONS = (
-    ("Продолжи ряд: 2, 4, 8, 16, ?", ("32",)),
-    ("Сколько месяцев в году имеют 28 дней?", ("12", "двенадцать")),
-    ("Что принадлежит тебе, но другие произносят это чаще тебя?", ("имя", "моё имя", "мое имя")),
-    ("У стола четыре угла. Один угол отпилили. Сколько углов стало?", ("5", "пять")),
-    ("Продолжи ряд Фибоначчи: 1, 1, 2, 3, 5, ?", ("8", "восемь")),
-    ("Сколько будет 60 + 25?", ("85", "восемьдесят пять")),
-    ("Что тяжелее: килограмм железа или килограмм пуха?", ("одинаково", "одинаковый вес", "одинаковый")),
-    ("У двух отцов и двух сыновей три яблока, каждому досталось по одному. Сколько их было?", ("3", "три")),
-    ("Какое число лишнее: 2, 4, 6, 9, 10?", ("9", "девять")),
-    ("Столица Франции?", ("париж",)),
-    ("Столица Японии?", ("токио",)),
-    ("Сколько сторон у шестиугольника?", ("6", "шесть")),
-    ("Продолжи ряд: 1, 4, 9, 16, ?", ("25", "двадцать пять")),
-    ("Что можно увидеть с закрытыми глазами?", ("сон", "сны")),
-    ("В корзине 5 яблок. Как раздать их пяти детям, оставив одно яблоко в корзине?", ("отдать яблоко вместе с корзиной", "с корзиной", "корзину")),
+    ("Продолжи ряд: 2, 4, 8, 16, ?", ("32", "тридцать два"), ("24", "32", "34", "36")),
+    ("Сколько месяцев в году имеют 28 дней?", ("12", "двенадцать"), ("1", "2", "11", "12")),
+    ("Что принадлежит тебе, но другие произносят это чаще тебя?", ("имя", "моё имя", "мое имя"), ("имя", "фамилия", "возраст", "адрес")),
+    ("У стола четыре угла. Один угол отпилили. Сколько углов стало?", ("5", "пять"), ("3", "4", "5", "6")),
+    ("Продолжи ряд Фибоначчи: 1, 1, 2, 3, 5, ?", ("8", "восемь"), ("7", "8", "9", "10")),
+    ("Сколько будет 60 + 25?", ("85", "восемьдесят пять"), ("75", "80", "85", "95")),
+    ("Что тяжелее: килограмм железа или килограмм пуха?", ("одинаково", "одинаковый вес", "одинаковый"), ("одинаково", "железо", "пух")),
+    ("У двух отцов и двух сыновей три яблока, каждому досталось по одному. Сколько их было?", ("3", "три"), ("2", "3", "4", "6")),
+    ("Какое число лишнее: 2, 4, 6, 9, 10?", ("9", "девять"), ("2", "6", "9", "10")),
+    ("Столица Франции?", ("париж",), ("Париж", "Рим", "Мадрид", "Берлин")),
+    ("Столица Японии?", ("токио",), ("Пекин", "Токио", "Сеул", "Осака")),
+    ("Сколько сторон у шестиугольника?", ("6", "шесть"), ("5", "6", "7", "8")),
+    ("Продолжи ряд: 1, 4, 9, 16, ?", ("25", "двадцать пять"), ("20", "24", "25", "36")),
+    ("Что можно увидеть с закрытыми глазами?", ("сон", "сны"), ("сон", "звёзды", "комнату", "цвет")),
+    ("В корзине 5 яблок. Как раздать их пяти детям, оставив одно яблоко в корзине?", ("отдать яблоко вместе с корзиной", "с корзиной", "корзину"), ("отдать по половине", "отдать яблоко вместе с корзиной", "одно оставить себе", "разрезать яблоки")),
+    ("Может ли ноль быть чётным числом?", ("да", "может"), ("Да", "Нет")),
+    ("Если сегодня понедельник, будет ли через 7 дней снова понедельник?", ("да", "будет"), ("Да", "Нет")),
 )
 
 
@@ -471,7 +479,7 @@ def record_weekly_event(
 
 def leaderboard(db: sqlite3.Connection, chat_id: int) -> str:
     rows = db.execute(
-        "SELECT c.name,c.personality,c.level,c.total_xp,"
+        "SELECT c.name,c.user_id,c.personality,c.level,c.total_xp,"
         "COALESCE(SUM(s.points),0) AS points,COALESCE(SUM(s.messages),0) AS messages,"
         "COALESCE(SUM(s.care_done),0) AS care_done,COALESCE(SUM(s.games_played),0) AS games_played "
         "FROM cats c LEFT JOIN weekly_stats s ON s.cat_id=c.cat_id AND s.chat_id=c.chat_id "
@@ -486,7 +494,9 @@ def leaderboard(db: sqlite3.Connection, chat_id: int) -> str:
     lines = ["🏆 Таблица лидеров за всё время", "Очки и статистика не сбрасываются вместе с недельным заданием."]
     medals = ("🥇", "🥈", "🥉")
     lines.extend(
-        f"{medals[index] if index < 3 else f'{index + 1}.'} {row['name']} — {row['points']} очк. · "
+        f"{medals[index] if index < 3 else f'{index + 1}.'} "
+        f"<a href=\"tg://user?id={int(row['user_id'])}\">{html.escape(str(row['name']))}</a> — "
+        f"{row['points']} очк. · "
         f"{row['messages']} сообщ. · уход {row['care_done']} · игр {row['games_played']} · "
         f"ур. {row['level']} · {row['personality']}"
         for index, row in enumerate(rows)
@@ -1422,6 +1432,48 @@ def _item_count(db: sqlite3.Connection, cat_id: int, item_key: str) -> int:
     return int(row["quantity"]) if row else 0
 
 
+def _purchase_item(
+    db: sqlite3.Connection, user_id: int,
+    cat: sqlite3.Row, item_key: str,
+) -> str:
+    title, cost, _detail = ITEMS[item_key]
+    if item_key == "feeder" and _item_count(db, int(cat["cat_id"]), item_key):
+        return "У котика уже есть автокормушка. Загрузи её командой /use feeder."
+    if int(cat["stones"]) < cost:
+        return f"{title} стоит {cost} камушков, сейчас у котика {cat['stones']}."
+    game.change_stones(db, cat, -cost, "покупка предмета", user_id, title)
+    db.execute(
+        "INSERT INTO cat_items(cat_id,item_key,quantity) VALUES(?,?,1) "
+        "ON CONFLICT(cat_id,item_key) DO UPDATE SET quantity=quantity+1",
+        (cat["cat_id"], item_key),
+    )
+    db.commit()
+    return f"🛍️ Куплено: {title}. Потрачено {cost} камушков."
+
+
+def _shop_page(
+    db: sqlite3.Connection, cat: sqlite3.Row, user_id: int,
+) -> tuple[str, dict[str, Any]]:
+    lines = [f"🛒 Магазин котика {cat['name']}", f"Баланс: 🪨 {cat['stones']} камушков", ""]
+    buttons: list[list[dict[str, str]]] = []
+    for key, (title, cost, detail) in ITEMS.items():
+        quantity = _item_count(db, int(cat["cat_id"]), key)
+        if key == "feeder" and quantity:
+            stock = "Уже есть"
+        elif quantity:
+            stock = f"У тебя: {quantity}"
+        else:
+            stock = detail
+        lines.append(f"{title} — {cost} камушков ({stock}).\n{ITEM_INFO[key]}")
+        button_title = "✅ Автокормушка уже есть" if key == "feeder" and quantity else f"Купить: {title} · {cost} 🪨"
+        buttons.append([{
+            "text": button_title,
+            "callback_data": f"shop:buy:{user_id}:{key}",
+        }])
+    buttons.append([{"text": "🐱 Назад к котику", "callback_data": f"cat:profile:{user_id}"}])
+    return "\n\n".join(lines), {"inline_keyboard": buttons}
+
+
 def _item_command(
     db: sqlite3.Connection, message: dict[str, Any], command: str, args: list[str], send: GameSender
 ) -> None:
@@ -1429,12 +1481,6 @@ def _item_command(
     user_id = int(message.get("from", {}).get("id", 0))
     cat, _, notices = game._prepare_cat(db, chat_id, user_id)
     game._send_notices(send, chat_id, notices)
-    if command == "shop":
-        lines = ["🛒 Магазин котика"]
-        for key, (title, cost, detail) in ITEMS.items():
-            lines.append(f"/buy {key} — {title}, {cost} камушков ({detail})")
-        send(chat_id, "\n".join(lines))
-        return
     if not cat:
         send(chat_id, "Сначала заведи котика командой /cat Имя.")
         return
@@ -1453,33 +1499,19 @@ def _item_command(
         send(chat_id, "\n".join(lines))
         return
     if not args:
-        send(chat_id, f"Укажи предмет. Посмотреть ассортимент: /shop. Команды: /buy и /use.")
+        send(chat_id, "Укажи предмет: /buy feeder, /buy toy или /buy wand. Описание есть в магазине в карточке /cat.")
         return
     key = _item_key(args[0])
     if not key:
-        send(chat_id, "Не знаю такой предмет. Посмотреть ассортимент: /shop.")
+        send(chat_id, "Не знаю такой предмет. Посмотри ассортимент в магазине в карточке /cat.")
         return
     if command == "buy":
-        title, cost, _ = ITEMS[key]
-        if key == "feeder" and _item_count(db, int(cat["cat_id"]), key):
-            send(chat_id, "У котика уже есть автокормушка. Загрузи её командой /use feeder.")
-            return
-        if int(cat["stones"]) < cost:
-            send(chat_id, f"{title} стоит {cost} камушков, сейчас у котика {cat['stones']}.")
-            return
-        game.change_stones(db, cat, -cost, "покупка предмета", user_id, ITEMS[key][0])
-        db.execute(
-            "INSERT INTO cat_items(cat_id,item_key,quantity) VALUES(?,?,1) "
-            "ON CONFLICT(cat_id,item_key) DO UPDATE SET quantity=quantity+1",
-            (cat["cat_id"], key),
-        )
-        db.commit()
-        send(chat_id, f"🛍️ Куплено: {title}. Потрачено {cost} камушков.")
+        send(chat_id, _purchase_item(db, user_id, cat, key))
         return
 
     quantity = _item_count(db, int(cat["cat_id"]), key)
     if quantity < 1:
-        send(chat_id, f"У котика нет этого предмета. Посмотреть ассортимент: /shop.")
+        send(chat_id, "У котика нет этого предмета. Посмотри ассортимент в магазине в карточке /cat.")
         return
     if key == "feeder":
         room = max(0, 3 - int(cat["feeder_food"]))
@@ -1527,6 +1559,55 @@ def _item_command(
         )
         db.commit()
         send(chat_id, f"✨ Палочка нежности помогла помириться. Доверие с {_display_user(db, chat_id, partner)} выросло на {boost}.")
+
+
+def handle_shop_callback(
+    db: sqlite3.Connection,
+    callback: dict[str, Any],
+    send: GameSender,
+    answer_callback: Callable[[str, str], Any],
+    edit_message: Callable[..., Any],
+) -> bool:
+    data = str(callback.get("data", ""))
+    if not data.startswith("shop:"):
+        return False
+    query_id = str(callback.get("id", ""))
+    user_id = int(callback.get("from", {}).get("id", 0))
+    message = callback.get("message", {})
+    chat_id = int(message.get("chat", {}).get("id", 0))
+    message_id = int(message.get("message_id", 0))
+    try:
+        parts = data.split(":")
+        action = parts[1]
+        owner_id = int(parts[2])
+        item_key = parts[3] if len(parts) > 3 else ""
+    except (IndexError, TypeError, ValueError):
+        answer_callback(query_id, "Кнопка магазина устарела. Открой /cat ещё раз.")
+        return True
+    if user_id != owner_id:
+        answer_callback(query_id, "Магазин открыт для владельца котика.")
+        return True
+    cat, _daily, notices = game._prepare_cat(db, chat_id, user_id)
+    game._send_notices(send, chat_id, notices)
+    if not cat:
+        answer_callback(query_id, "Сначала создай котика командой /cat ИМЯ.")
+        return True
+    if action == "buy":
+        if item_key not in ITEMS:
+            answer_callback(query_id, "Неизвестный товар.")
+            return True
+        result = _purchase_item(db, user_id, cat, item_key)
+        cat = game._current_cat(db, chat_id, user_id)
+        answer_text = result
+    elif action == "open":
+        answer_text = "Магазин котика"
+    else:
+        answer_callback(query_id, "Раздел магазина не найден. Открой /cat ещё раз.")
+        return True
+    text, markup = _shop_page(db, cat, user_id)
+    edit_message(chat_id, message_id, text, markup)
+    answer_callback(query_id, answer_text[:190])
+    return True
 
 
 def _consume_item(db: sqlite3.Connection, cat_id: int, item_key: str) -> None:
@@ -1763,7 +1844,7 @@ def handle_pending_game_stake(db: sqlite3.Connection, message: dict[str, Any], s
     if int(setup["expires_at"]) <= int(time.time()):
         db.execute("DELETE FROM pending_game_stakes WHERE setup_id=?", (setup["setup_id"],))
         db.commit()
-        send(chat_id, "Время выбора ставки истекло. Запусти /ttt или /race ещё раз.")
+        send(chat_id, "Время выбора ставки истекло. Открой /play или запусти /race ещё раз.")
         return True
     if not text.isdigit():
         send(chat_id, f"Отправь ставку целым числом от 1 до {MAX_STAKE}, например 10.")
@@ -1853,21 +1934,6 @@ def _ttt_command(
             db.commit()
             send(chat_id, "Настройка ставки отменена.")
             return
-    if command == "ttt":
-        target = _target(db, chat_id, message, args)
-        if not target:
-            send(chat_id, "Ответь командой /ttt на сообщение соперника, чтобы выбрать ставку кнопкой или числом.")
-            return
-        target_id = int(target["id"])
-        stake = next((int(arg) for arg in args if arg.isdigit()), None)
-        if stake is None:
-            _begin_stake_setup(db, chat_id, user_id, target_id, "ttt", send)
-            return
-        db.execute("DELETE FROM pending_game_stakes WHERE chat_id=? AND user_id=?", (chat_id, user_id))
-        db.commit()
-        _start_game_invitation(db, chat_id, user_id, target_id, "ttt", stake, send)
-        return
-
     if command == "cancelgame":
         row = db.execute(
             "SELECT * FROM ttt_games WHERE chat_id=? AND state='pending' AND player_x=? ORDER BY game_id DESC LIMIT 1",
@@ -2155,6 +2221,39 @@ def _normalize_answer(value: str) -> str:
     return " ".join(value.split())
 
 
+def _logic_choices(question: str, answers: list[str], entry: dict[str, Any] | None = None) -> list[str]:
+    if entry and entry.get("choices"):
+        return [str(choice) for choice in entry["choices"]]
+    normalized_question = _normalize_answer(question)
+    for bank_question, _accepted, choices in LOGIC_QUESTIONS:
+        if _normalize_answer(bank_question) == normalized_question:
+            return list(choices)
+    # Old in-progress games may predate the saved choice list. Keep them playable.
+    fallback = [str(answer) for answer in answers]
+    for candidate in ("Да", "Нет", "Не знаю", "Попробуй подумать"):
+        if len(fallback) >= 4:
+            break
+        if _normalize_answer(candidate) not in {_normalize_answer(item) for item in fallback}:
+            fallback.append(candidate)
+    return fallback
+
+
+def _logic_markup(row: sqlite3.Row) -> dict[str, Any]:
+    question_set = json.loads(str(row["questions_json"]))
+    index = max(0, int(row["round_index"]) - 1)
+    entry = question_set[index] if index < len(question_set) else None
+    choices = _logic_choices(
+        str(row["question"]), json.loads(str(row["answers_json"])), entry,
+    )
+    rows = []
+    for start in range(0, len(choices), 2):
+        rows.append([
+            {"text": choice, "callback_data": f"lg:{row['logic_id']}:{choice_index}"}
+            for choice_index, choice in list(enumerate(choices))[start:start + 2]
+        ])
+    return _play_keyboard(rows)
+
+
 def _ttt_lines(size: int) -> list[tuple[int, ...]]:
     needed = size if size == 3 else 4
     lines: list[tuple[int, ...]] = []
@@ -2323,23 +2422,30 @@ def _handle_join_lobby(
                 record_weekly_event(db, participant_cat, "games", winner=participant_id == winner_id if score_a != score_b else False)
     else:
         question_set = random.sample(LOGIC_QUESTIONS, k=min(5, len(LOGIC_QUESTIONS)))
-        question, answers = question_set[0]
+        question, answers, choices = question_set[0]
         db.execute(
             "INSERT INTO logic_games(chat_id,player_a,player_b,stake,question,answers_json,questions_json,round_index,score_a,score_b,message_id,state,created_at) "
             "VALUES(?,?,?,?,?,?,?,1,0,0,?,'active',?)",
             (
                 chat_id, owner_id, user_id, stake, question,
                 json.dumps(answers, ensure_ascii=False),
-                json.dumps([{"question": q, "answers": a} for q, a in question_set], ensure_ascii=False),
+                json.dumps(
+                    [{"question": q, "answers": a, "choices": choices} for q, a, choices in question_set],
+                    ensure_ascii=False,
+                ),
                 message_id, int(time.time()),
             ),
         )
         db.commit()
+        game_row = db.execute(
+            "SELECT * FROM logic_games WHERE chat_id=? AND message_id=? AND state='active' ORDER BY logic_id DESC LIMIT 1",
+            (chat_id, message_id),
+        ).fetchone()
         _edit_game_message(
             edit_message, chat_id, message_id,
             f"💡 Логическая дуэль · раунд 1/5\nСтавка: {stake} камушков с каждого.\n"
-            f"❔ {question}\n\nОба игрока пишут ответ прямо в чат. За каждый раунд очко получает первый верно ответивший.",
-            {"inline_keyboard": []},
+            f"❔ {question}\n\nВыбери ответ кнопкой или напиши его в чат. Очко получает первый верно ответивший.",
+            _logic_markup(game_row) if game_row else {"inline_keyboard": []},
         )
     answer_callback(query_id, "Игра началась!")
 
@@ -2596,9 +2702,61 @@ def handle_logic_answer(
         edit_message(
             chat_id, int(row["message_id"] or 0),
             f"✅ Раунд {round_index}/5 завершён: {_display_user(db, chat_id, user_id)} получает очко.\n"
-            f"Счёт: {score_a}:{score_b}\n\n💡 Раунд {next_round}/5\n❔ {next_question['question']}\n\nПервый верный ответ получает очко.",
-            {"inline_keyboard": []},
+            f"Счёт: {score_a}:{score_b}\n\n💡 Раунд {next_round}/5\n❔ {next_question['question']}\n\n"
+            "Выбери ответ кнопкой или напиши его в чат. Очко получает первый верно ответивший.",
+            _logic_markup(db.execute("SELECT * FROM logic_games WHERE logic_id=?", (row["logic_id"],)).fetchone()),
         )
+    return True
+
+
+def handle_logic_callback(
+    db: sqlite3.Connection,
+    callback: dict[str, Any],
+    send: GameSender,
+    answer_callback: Callable[[str, str], Any],
+    edit_message: Callable[..., Any],
+) -> bool:
+    data = str(callback.get("data", ""))
+    if not data.startswith("lg:"):
+        return False
+    query_id = str(callback.get("id", ""))
+    user_id = int(callback.get("from", {}).get("id", 0))
+    chat_id = int(callback.get("message", {}).get("chat", {}).get("id", 0))
+    try:
+        _, game_text, choice_text = data.split(":", 2)
+        logic_id, choice_index = int(game_text), int(choice_text)
+    except (ValueError, TypeError):
+        answer_callback(query_id, "Эта кнопка устарела. Запусти новую игру через /play.")
+        return True
+    row = db.execute(
+        "SELECT * FROM logic_games WHERE logic_id=? AND chat_id=? AND state='active'",
+        (logic_id, chat_id),
+    ).fetchone()
+    if not row:
+        answer_callback(query_id, "Этот раунд уже завершён.")
+        return True
+    if user_id not in (int(row["player_a"]), int(row["player_b"])):
+        answer_callback(query_id, "Отвечать в этой дуэли могут только её участники.")
+        return True
+    question_set = json.loads(str(row["questions_json"]))
+    round_index = max(0, int(row["round_index"]) - 1)
+    entry = question_set[round_index] if round_index < len(question_set) else None
+    answers = json.loads(str(row["answers_json"]))
+    choices = _logic_choices(str(row["question"]), answers, entry)
+    if choice_index < 0 or choice_index >= len(choices):
+        answer_callback(query_id, "Вариант ответа не найден. Нажми кнопку ещё раз.")
+        return True
+    selected = choices[choice_index]
+    if _normalize_answer(selected) not in {_normalize_answer(str(answer)) for answer in answers}:
+        answer_callback(query_id, "Не тот вариант — попробуй ещё раз!")
+        return True
+    accepted = handle_logic_answer(
+        db,
+        {"chat": {"id": chat_id}, "from": {"id": user_id}, "text": selected},
+        send,
+        edit_message,
+    )
+    answer_callback(query_id, "Верно! Очко засчитано." if accepted else "Раунд уже изменился.")
     return True
 
 
@@ -2674,7 +2832,7 @@ def handle_command(
         if command == "weekly":
             send(chat_id, weekly_status(db, chat_id, user_id))
         elif command == "leaderboard":
-            send(chat_id, leaderboard(db, chat_id))
+            send(chat_id, leaderboard(db, chat_id), parse_mode="HTML")
         elif command == "play":
             _play_menu(db, chat_id, user_id, send)
         elif command in {"quiz", "answer"}:
@@ -2688,11 +2846,11 @@ def handle_command(
         _marriage_command(db, message, command, args, send)
     elif command in {"kiss", "hug", "relationship", "jealous", "breakup"}:
         _relationship_command(db, message, command, args, send)
-    elif command in {"shop", "buy", "items", "use"}:
+    elif command in {"buy", "items", "use"}:
         _item_command(db, message, command, args, send)
     elif command == "race":
         _race_command(db, message, args, send)
-    elif command in {"ttt", "accept", "decline", "cancelgame", "move", "resign"}:
+    elif command in {"accept", "decline", "cancelgame", "move", "resign"}:
         _ttt_command(db, message, command, args, send, edit_message)
     else:
         return False

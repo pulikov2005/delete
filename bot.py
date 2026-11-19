@@ -1051,8 +1051,7 @@ def handle_group_command(
             "<code>/warn причина</code> — выдать WARN ответом на сообщение или через @username. WARN действует 7 дней; третий активный WARN за этот срок приводит к бану на 7 дней.\n"
             "<code>/warns</code> — посмотреть свои предупреждения; модератор или админ может указать другого участника. <code>/unwarn</code> — снять последнее, <code>/warnclear</code> — снять все (только админ).\n"
             "<code>/stats</code> — статистика беседы; ответь командой на сообщение или укажи @username для личной статистики.\n\n"
-            "🐱 <code>/cat ИМЯ</code> — создать котика; если отправить просто <code>/cat</code>, бот попросит ввести имя. Без котика обычные сообщения не попадут в чат.\n"
-            "<code>/stat</code> — посмотреть свои камушки и последние причины изменения баланса. <code>/stats</code> — общая статистика беседы.\n"
+            "🐱 <code>/cat ИМЯ</code> — создать котика; <code>/cat</code> открывает его карточку: баланс, сообщения, уровень и задания. Кнопки покажут историю камушков и задания. Без котика обычные сообщения не попадут в чат.\n"
             "<code>/rename Имя</code> — переименовать котика; цена — 10 камушков. <code>/task</code> — ежедневное задание и кнопка правильного действия. Нажимай только её; /brush и /clean срабатывают лишь для выпавшего задания.\n"
             "<code>/feed</code> — потратить рыбку и повысить настроение на 1; активный мини-котёнок средней редкости даёт ещё +1.\n"
             "<code>/fishing</code> — раз в день попробовать поймать камушек: шанс находки 70%, шанс пустой рыбалки — 30%.\n"
@@ -1067,12 +1066,12 @@ def handle_group_command(
             "<code>/acceptmarriage</code> или <code>/declinemarriage</code> — ответить; <code>/divorce</code> — развестись; <code>/family</code> — семья и мини-котята.\n"
             "В браке взаимные поцелуи дают раз в неделю шанс 30% на мини-котёнка. Его нужно назвать: <code>/namekitten Имя</code>, при нескольких — <code>/namekitten ID Имя</code>. Активная способность выбирается через <code>/activekitten ID</code>.\n\n"
             "<b>Предметы</b>\n"
-            "<code>/shop</code>, <code>/buy предмет</code>, <code>/items</code>, <code>/use предмет</code>.\n"
-            "Есть автокормушка, игрушечная мышка и палочка нежности.\n\n"
+            "Нажми «Магазин» в карточке <code>/cat</code>, чтобы прочитать описание, цену и купить предмет. Есть автокормушка, игрушечная мышка и палочка нежности.\n"
+            "<code>/items</code> — инвентарь; <code>/use предмет</code> — применить вещь. Купить также можно командой <code>/buy предмет</code>.\n\n"
             "<b>Игры</b>\n"
             "<code>/play</code> — открыть меню игр, выбрать ставку и настройки. Вызов увидят все участники; первый, кто нажмёт «Присоединиться», станет соперником.\n"
-            "В меню есть крестики-нолики с полем 3×3 или 4×4, котогонка и логическая дуэль на 5 вопросов: первый, кто наберёт 3 очка, выигрывает банк.\n"
-            "Старые команды <code>/ttt</code> и <code>/race</code> тоже пока доступны для вызова конкретного участника.\n"
+            "В меню есть крестики-нолики с полем 3×3 или 4×4, котогонка и логическая дуэль на 5 вопросов: выбирай ответ кнопкой из 2 или 4 вариантов либо напиши его сообщением. Первый, кто наберёт 3 очка, выигрывает банк.\n"
+            "Крестики-нолики запускаются через <code>/play</code>. Для вызова соперника в котогонку можно ответить командой <code>/race</code>.\n"
             "<code>/accept</code> или <code>/decline</code>, отменить своё приглашение — <code>/cancelgame</code>.\n"
             "Ход делается нажатием на клетку в сообщении с полем; выйти можно командой <code>/resign</code>.\n\n"
             "<b>Недельное задание</b>\n"
@@ -1431,9 +1430,21 @@ def handle_update(db: sqlite3.Connection, update: dict[str, Any], bot_username: 
             "answerCallbackQuery",
             {"callback_query_id": query_id, "text": text, "show_alert": False},
         )
-        handled = game.handle_task_callback(
+        handled = game.handle_cat_callback(
             db, callback, send_message, answer_callback, edit_game_message,
         )
+        if not handled:
+            handled = social_game.handle_shop_callback(
+                db, callback, send_message, answer_callback, edit_game_message,
+            )
+        if not handled:
+            handled = game.handle_task_callback(
+                db, callback, send_message, answer_callback, edit_game_message,
+            )
+        if not handled:
+            handled = social_game.handle_logic_callback(
+                db, callback, send_message, answer_callback, edit_game_message,
+            )
         if not handled:
             handled = social_game.handle_play_callback(
                 db, callback, send_message, answer_callback, edit_game_message,
@@ -1552,8 +1563,7 @@ def main() -> None:
                 {"command": "unwarn", "description": "Снять последнее или указанное предупреждение"},
                 {"command": "warnclear", "description": "Снять все предупреждения (админ)"},
                 {"command": "stats", "description": "Статистика котиков и сообщений"},
-                {"command": "stat", "description": "Свои камушки и история баланса"},
-                {"command": "cat", "description": "Создать котика: /cat ИМЯ"},
+                {"command": "cat", "description": "Создать котика или открыть свою карточку"},
                 {"command": "rename", "description": "Переименовать котика (10 камушков)"},
                 {"command": "kiss", "description": "Выразить симпатию взаимно"},
                 {"command": "hug", "description": "Укрепить доверие в паре"},
@@ -1568,11 +1578,9 @@ def main() -> None:
                 {"command": "divorce", "description": "Расторгнуть брак"},
                 {"command": "namekitten", "description": "Назвать мини-котёнка"},
                 {"command": "activekitten", "description": "Выбрать активного котёнка"},
-                {"command": "shop", "description": "Магазин предметов"},
                 {"command": "buy", "description": "Купить предмет за камушки"},
                 {"command": "items", "description": "Посмотреть вещи котика"},
                 {"command": "use", "description": "Использовать предмет"},
-                {"command": "ttt", "description": "Ответом на сообщение выбрать ставку в крестиках-ноликах"},
                 {"command": "race", "description": "Ответом на сообщение выбрать ставку в котогонке"},
                 {"command": "accept", "description": "Принять вызов в игру"},
                 {"command": "decline", "description": "Отклонить вызов в игру"},
